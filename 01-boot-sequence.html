@@ -1,0 +1,680 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The Boot Sequence - Linux Under the Hood</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "navy";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Part I — The System Starts</li><li class="chapter-item expanded "><a href="01-boot-sequence.html" class="active"><strong aria-hidden="true">1.</strong> The Boot Sequence</a></li><li class="chapter-item expanded affix "><li class="part-title">Part II — Processes & Memory (coming soon)</li><li class="chapter-item expanded affix "><li class="part-title">Part III — Filesystem & I/O (coming soon)</li><li class="chapter-item expanded affix "><li class="part-title">Part IV — Networking & Security (coming soon)</li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Linux Under the Hood</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/xiaofeng-xu/linux-under-the-hood" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/xiaofeng-xu/linux-under-the-hood/edit/main/src/src/01-boot-sequence.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="linux-deep-dive-1-the-boot-sequence--from-power-button-to-shell-prompt"><a class="header" href="#linux-deep-dive-1-the-boot-sequence--from-power-button-to-shell-prompt">Linux Deep Dive #1: The Boot Sequence — From Power Button to Shell Prompt</a></h1>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>You press the power button. About 10–30 seconds later, a shell prompt appears. What happened in between?</p>
+<p>Most developers treat this as a black box. That's a shame — the Linux boot sequence is one of the most elegant pieces of engineering in the entire system. It's a relay race where each stage does just enough work to hand off to the next. Miss any baton and the system halts.</p>
+<p>This post tears the black box open. We'll trace every handoff from firmware to your first interactive shell, using a real Fedora 43 machine as the specimen.</p>
+<hr />
+<h2 id="the-relay-race-at-a-glance"><a class="header" href="#the-relay-race-at-a-glance">The Relay Race at a Glance</a></h2>
+<pre><code>Power on
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 1 — UEFI Firmware                       ~6s          │
+│  POST → find ESP → load shim.efi → load grubx64.efi        │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 2 — GRUB2 Bootloader                    ~3s          │
+│  Read grub.cfg → show menu → load vmlinuz + initramfs       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 3 — Kernel Initialization               ~2s          │
+│  Decompress → setup memory → init subsystems → mount initrd │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 4 — initramfs                           ~15s         │
+│  Unlock LUKS → find root filesystem → pivot_root            │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 5 — systemd (PID 1)                     ~12s         │
+│  Parse units → mount filesystems → start services           │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 6 — Login / Shell                                    │
+│  getty → login → PAM → your shell                           │
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Those phase timings aren't invented — they come directly from <code>systemd-analyze</code> on this machine:</p>
+<pre><code>$ systemd-analyze
+Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
+                 + 15.109s (initrd) + 12.194s (userspace) = 37.501s
+</code></pre>
+<p>Systemd measures and records every phase. The kernel literally timestamps when it hands off to initramfs, and systemd records when it took over. We'll use this throughout.</p>
+<hr />
+<h2 id="phase-1--uefi-firmware"><a class="header" href="#phase-1--uefi-firmware">Phase 1 — UEFI Firmware</a></h2>
+<h3 id="what-bios-used-to-do"><a class="header" href="#what-bios-used-to-do">What BIOS used to do</a></h3>
+<p>The old BIOS (Basic Input/Output System) was a 16-bit program burned into a chip. At power-on it ran <strong>POST</strong> (Power-On Self Test) — checking RAM, CPU, devices — then looked for a bootable disk by reading the first 512 bytes (the <strong>Master Boot Record</strong>). The first 446 bytes were executable bootloader code, 64 bytes were a partition table, and the last 2 bytes were a magic signature <code>0x55 0xAA</code>. This is why old bootloaders had to fit in 446 bytes. Absurd.</p>
+<p>Modern systems use <strong>UEFI</strong> (Unified Extensible Firmware Interface), which is essentially a small operating system. It understands GPT partition tables, reads FAT32 filesystems, and can load proper <code>.efi</code> executables. No 446-byte constraint.</p>
+<h3 id="the-efi-system-partition-esp"><a class="header" href="#the-efi-system-partition-esp">The EFI System Partition (ESP)</a></h3>
+<p>UEFI stores bootloaders in a dedicated FAT32 partition called the <strong>EFI System Partition (ESP)</strong>. On this Fedora machine:</p>
+<pre><code>$ efibootmgr -v
+BootCurrent: 0005
+BootOrder: 0005,0004,0002,0001,0000,0003,0006,0007
+
+Boot0005* Fedora  HD(1,GPT,e7f9e70d-...)/\EFI\FEDORA\SHIM.EFI
+Boot0001  Fedora  HD(1,GPT,e7f9e70d-...)/\EFI\FEDORA\SHIMX64.EFI
+Boot0000  Windows Boot Manager  ...
+</code></pre>
+<p><code>BootCurrent: 0005</code> — we booted entry 0005, which points to <code>\EFI\FEDORA\SHIM.EFI</code> on partition 1 (the ESP).</p>
+<p>The UEFI firmware reads this table, opens the ESP, loads <code>SHIM.EFI</code>, and jumps to it.</p>
+<h3 id="secure-boot-and-the-shim"><a class="header" href="#secure-boot-and-the-shim">Secure Boot and the Shim</a></h3>
+<p>Why <code>SHIM.EFI</code> and not <code>grubx64.efi</code> directly?</p>
+<p><strong>Secure Boot</strong> is a UEFI feature that refuses to execute unsigned binaries. Only code signed by a key in the firmware's database is allowed to run. Microsoft controls the keys in most consumer firmware — which creates a problem for Linux distributions: they can't ship a GRUB2 signed by Microsoft for every distro release.</p>
+<p>The solution is a <strong>shim</strong>: a tiny, Microsoft-signed binary whose only job is to load another bootloader after verifying it against a second key database — one that Red Hat (or Canonical, or SUSE) controls.</p>
+<pre><code>UEFI firmware
+    │
+    │  verifies against Microsoft key database
+    ▼
+shim.efi          ← signed by Microsoft
+    │
+    │  verifies against Red Hat key database
+    ▼
+grubx64.efi       ← signed by Red Hat
+    │
+    │  verifies against Red Hat key database
+    ▼
+vmlinuz            ← signed by Red Hat
+</code></pre>
+<p>You can inspect the ESP yourself (you'll need root):</p>
+<pre><code class="language-bash"># The ESP is mounted at /boot/efi
+ls /boot/efi/EFI/fedora/
+# shim.efi  shimx64.efi  grubx64.efi  grub.cfg  ...
+</code></pre>
+<h3 id="what-uefi-hands-to-grub"><a class="header" href="#what-uefi-hands-to-grub">What UEFI hands to GRUB</a></h3>
+<p>UEFI doesn't just load GRUB and forget it. It passes a <strong>handoff structure</strong> containing:</p>
+<ul>
+<li>The memory map (what physical RAM exists and which regions are usable)</li>
+<li>A pointer to the UEFI runtime services (which the kernel uses later for things like <code>efivarfs</code>)</li>
+<li>ACPI tables</li>
+</ul>
+<p>Once GRUB is running, UEFI is mostly done.</p>
+<hr />
+<h2 id="phase-2--grub2-bootloader"><a class="header" href="#phase-2--grub2-bootloader">Phase 2 — GRUB2 Bootloader</a></h2>
+<p>GRUB2 (GRand Unified Bootloader version 2) runs as a UEFI application. Its job: find the kernel and initramfs on disk, load them into RAM, set up the kernel command line, and jump to the kernel entry point.</p>
+<h3 id="reading-the-config"><a class="header" href="#reading-the-config">Reading the config</a></h3>
+<p>GRUB2 reads <code>/boot/grub2/grub.cfg</code>. On Fedora this file is auto-generated by <code>grub2-mkconfig</code>. You typically never edit it by hand — instead edit <code>/etc/default/grub</code> and regenerate. The config describes menu entries, timeouts, and kernel arguments.</p>
+<pre><code class="language-bash"># See the GRUB environment (saved default, etc.)
+sudo grub2-editenv list
+# saved_entry=...
+# kernelopts=root=UUID=... ro rootflags=subvol=root ...
+# boot_success=1
+</code></pre>
+<h3 id="the-kernel-command-line"><a class="header" href="#the-kernel-command-line">The kernel command line</a></h3>
+<p>After loading the kernel, GRUB passes a command line string. You can always inspect what was actually used:</p>
+<pre><code class="language-bash">$ cat /proc/cmdline
+BOOT_IMAGE=(hd0,gpt2)/vmlinuz-6.19.11-200.fc43.x86_64
+  root=UUID=37e2f5e1-66e7-4a8a-a69e-57bcc9a44af2
+  ro
+  rootflags=subvol=root
+  rd.luks.uuid=luks-5ea459ba-b7ec-439a-a3cf-7d25ff3b2889
+  rhgb quiet
+</code></pre>
+<p>There's a lot of information here. Let's decode it:</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>BOOT_IMAGE=(hd0,gpt2)/vmlinuz-...</code></td><td>The kernel file GRUB loaded, from partition 2 of disk 0</td></tr>
+<tr><td><code>root=UUID=37e2f5e1-...</code></td><td>The root filesystem to mount after boot</td></tr>
+<tr><td><code>ro</code></td><td>Mount root read-only initially (fsck can run; remounted rw later)</td></tr>
+<tr><td><code>rootflags=subvol=root</code></td><td>Btrfs-specific: mount the <code>root</code> subvolume</td></tr>
+<tr><td><code>rd.luks.uuid=luks-5ea459ba-...</code></td><td>Tell initramfs to unlock a LUKS-encrypted device</td></tr>
+<tr><td><code>rhgb</code></td><td>Red Hat Graphical Boot (Plymouth splash screen)</td></tr>
+<tr><td><code>quiet</code></td><td>Suppress most kernel messages on console</td></tr>
+</tbody></table>
+</div>
+<p>This one command line tells the whole story of this machine's storage setup: there's a Btrfs filesystem inside a LUKS-encrypted container, and the bootable root is a subvolume within it.</p>
+<h3 id="what-grub-loads"><a class="header" href="#what-grub-loads">What GRUB loads</a></h3>
+<p>GRUB reads two files from <code>/boot</code> and loads them into RAM:</p>
+<ol>
+<li><strong><code>vmlinuz-6.19.11-200.fc43.x86_64</code></strong> — the compressed kernel image</li>
+<li><strong><code>initramfs-6.19.11-200.fc43.x86_64.img</code></strong> — a compressed archive (70MB on this system)</li>
+</ol>
+<pre><code class="language-bash">$ ls -lh /boot/vmlinuz-6.19.11-200.fc43.x86_64
+-rwxr-xr-x. 1 root root 18M Apr  2 16:55 /boot/vmlinuz-6.19.11-200.fc43.x86_64
+
+$ ls -lh /boot/initramfs-6.19.11-200.fc43.x86_64.img
+-rw-------. 1 root root 70M Apr  2 21:22 /boot/initramfs-6.19.11-200.fc43.x86_64.img
+</code></pre>
+<p>Once both are in RAM, GRUB jumps to the kernel's entry point. GRUB is done.</p>
+<hr />
+<h2 id="phase-3--kernel-initialization"><a class="header" href="#phase-3--kernel-initialization">Phase 3 — Kernel Initialization</a></h2>
+<h3 id="vmlinuz-whats-actually-in-that-file"><a class="header" href="#vmlinuz-whats-actually-in-that-file">vmlinuz: what's actually in that file</a></h3>
+<p>The kernel image isn't a plain ELF binary. It's a <strong>bzImage</strong> — a self-extracting compressed archive:</p>
+<pre><code class="language-bash">$ file /boot/vmlinuz-6.19.11-200.fc43.x86_64
+Linux kernel x86 boot executable, bzImage,
+  version 6.19.11-200.fc43.x86_64,
+  ZST compressed,
+  64-bit EFI handoff entry point
+</code></pre>
+<p>"bzImage" stands for "big zImage" (the <code>b</code> doesn't mean bzip2 — it means "big", as in it can be loaded above 1MB). Modern kernels are compressed with <strong>Zstandard (ZST)</strong> for faster decompression. When the kernel starts executing, the first thing it does is decompress itself into RAM.</p>
+<pre><code>[ GRUB jumps here ]
+vmlinuz (compressed)
+    │  arch/x86/boot/header.S  — 16-bit setup code
+    │  arch/x86/boot/compressed/head_64.S — decompress kernel
+    ▼
+vmlinux (uncompressed) loaded into RAM
+    │  arch/x86/kernel/head_64.S — 64-bit startup
+    │  start_kernel() in init/main.c
+    ▼
+kernel is running
+</code></pre>
+<h3 id="start_kernel-the-origin-of-everything"><a class="header" href="#start_kernel-the-origin-of-everything">start_kernel(): the origin of everything</a></h3>
+<p>Once decompressed, the kernel calls <code>start_kernel()</code> in <code>init/main.c</code> — one of the most consequential function calls in all of software. It initializes, in roughly this order:</p>
+<pre><code>start_kernel()
+├── setup_arch()          — CPU detection, parse command line, set up memory map
+├── mm_init()             — memory management subsystem
+├── sched_init()          — the scheduler (CFS)
+├── rcu_init()            — RCU (Read-Copy-Update) — kernel's lock-free data structure mechanism
+├── init_IRQ()            — interrupt controllers
+├── time_init()           — timekeeping
+├── softirq_init()        — deferred interrupt processing
+├── console_init()        — printk to the screen
+├── rest_init()           — spawn PID 1 and PID 2
+</code></pre>
+<p>You can see this happening in real time:</p>
+<pre><code class="language-bash">$ dmesg | head -30
+[    0.000000] Linux version 6.19.11-200.fc43.x86_64 (mockbuild@...) gcc 15.2.1
+[    0.000000] Command line: BOOT_IMAGE=(hd0,gpt2)/vmlinuz-6.19.11-...
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000000a0000-0x00000000000fffff] reserved
+...
+</code></pre>
+<p>The <code>[    0.000000]</code> timestamps are in seconds since kernel start. You can watch the kernel build up: memory map, then CPU features, then interrupts, then the scheduler. Every subsystem announces itself.</p>
+<h3 id="the-memory-map-e820"><a class="header" href="#the-memory-map-e820">The memory map (e820)</a></h3>
+<p>The first thing the kernel does is ask UEFI (via the data passed by GRUB): "what physical memory is available?" The answer comes as an <strong>e820 map</strong> (named after BIOS interrupt 0xe820, the ancient API that established the convention):</p>
+<pre><code class="language-bash">$ dmesg | grep -i 'e820\|usable\|reserved' | head -15
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000000a0000-0x00000000000fffff] reserved
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x0000000009bfefff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000000a0000-0x00000000000fffff] reserved
+...
+[    0.000000] BIOS-e820: [mem 0x0000000100000000-0x000000080e2fffff] usable
+</code></pre>
+<p>The first 640KB (<code>0x00000–0x9ffff</code>) is "usable" — traditional DOS territory. Then <code>0xa0000–0xfffff</code> is reserved — the old video RAM and ROM region. Nothing runs there. Above 1MB, RAM is usable again. Above 4GB (<code>0x100000000</code>), the rest of RAM is available.</p>
+<h3 id="spawning-pid-1-and-pid-2"><a class="header" href="#spawning-pid-1-and-pid-2">Spawning PID 1 and PID 2</a></h3>
+<p>At the end of <code>start_kernel()</code>, <code>rest_init()</code> creates two kernel threads:</p>
+<ul>
+<li><strong>PID 1</strong> — <code>kernel_init()</code>: will become the init process (eventually executes <code>/usr/lib/systemd/systemd</code>)</li>
+<li><strong>PID 2</strong> — <code>kthreadd</code>: the kernel thread daemon, parent of all other kernel threads</li>
+</ul>
+<p>The original <code>start_kernel()</code> thread becomes the <strong>idle thread</strong> (PID 0) — it runs whenever the CPU has nothing else to do, executing the <code>hlt</code> instruction.</p>
+<p>Before PID 1 can exec systemd though, there's an important intermediate step.</p>
+<hr />
+<h2 id="phase-4--initramfs-the-bootstrap-filesystem"><a class="header" href="#phase-4--initramfs-the-bootstrap-filesystem">Phase 4 — initramfs: The Bootstrap Filesystem</a></h2>
+<h3 id="the-chicken-and-egg-problem"><a class="header" href="#the-chicken-and-egg-problem">The chicken-and-egg problem</a></h3>
+<p>Here's the problem: the kernel needs to mount the root filesystem to run init. But to mount the root filesystem, you might need:</p>
+<ul>
+<li>Kernel modules for your storage controller (NVMe, SATA, etc.)</li>
+<li>Tools to unlock a LUKS-encrypted device</li>
+<li>Tools to assemble a RAID array or LVM volume</li>
+<li>Scripts to figure out which UUID maps to which <code>/dev/nvme0n1p3</code></li>
+</ul>
+<p>Those modules and tools live <em>on</em> the root filesystem — but the root filesystem isn't mounted yet. Classic chicken-and-egg.</p>
+<p>The solution: <strong>initramfs</strong> (initial RAM filesystem). The kernel bundles a minimal temporary root filesystem, mounts it first, does the preparatory work, then switches to the real root.</p>
+<h3 id="whats-in-initramfs"><a class="header" href="#whats-in-initramfs">What's in initramfs</a></h3>
+<p>The initramfs is a <strong>cpio archive</strong> (a Unix archiving format, like tar) compressed with zstd. It contains a miniature Linux environment:</p>
+<pre><code class="language-bash">$ lsinitrd /boot/initramfs-6.19.11-200.fc43.x86_64.img | head -40
+Image: /boot/initramfs-6.19.11-200.fc43.x86_64.img: 70M
+========================================================================
+
+# Explore the full contents:
+$ lsinitrd /boot/initramfs-6.19.11-200.fc43.x86_64.img | grep -E '\.(ko|service|sh)$' | head -20
+</code></pre>
+<p>On this system the initramfs is 70MB — because it contains:</p>
+<ul>
+<li>A copy of systemd (yes, systemd runs <em>inside</em> initramfs first)</li>
+<li>LUKS tools (<code>cryptsetup</code>) — required because the root fs is encrypted</li>
+<li>Btrfs tools — required to mount the subvolume</li>
+<li>NVMe and storage drivers</li>
+<li>A minimal <code>/etc</code>, <code>/dev</code>, <code>/sys</code>, <code>/proc</code></li>
+</ul>
+<p><strong>dracut</strong> is Fedora's tool for building initramfs images. It takes a modular approach: you declare which "dracut modules" you need, and it assembles the minimal environment for your specific machine.</p>
+<pre><code class="language-bash"># Rebuild initramfs for the current kernel (run as root):
+dracut --force
+
+# See what dracut modules were included:
+lsinitrd /boot/initramfs-$(uname -r).img | grep 'dracut module'
+</code></pre>
+<h3 id="luks-unlocking-in-the-initramfs"><a class="header" href="#luks-unlocking-in-the-initramfs">LUKS unlocking in the initramfs</a></h3>
+<p>This machine uses full-disk encryption. Look at the kernel command line again:</p>
+<pre><code>rd.luks.uuid=luks-5ea459ba-b7ec-439a-a3cf-7d25ff3b2889
+</code></pre>
+<p><code>rd.*</code> parameters are <strong>initramfs directives</strong> (the <code>rd</code> prefix comes from dracut: "ram disk"). During the initramfs phase, before the real root is mounted, the system must:</p>
+<ol>
+<li>Find the LUKS container by UUID</li>
+<li>Prompt you for a passphrase (or use a stored key)</li>
+<li>Use <code>cryptsetup luksOpen</code> to create a decrypted device mapper device</li>
+<li>Then mount <em>that</em> device as root</li>
+</ol>
+<p>This is why initramfs took <strong>15 seconds</strong> on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key).</p>
+<h3 id="pivot_root-switching-to-the-real-root"><a class="header" href="#pivot_root-switching-to-the-real-root">pivot_root: switching to the real root</a></h3>
+<p>Once the real root filesystem is mounted (say, at <code>/sysroot</code> within the initramfs), the kernel performs a <strong>pivot_root</strong> operation: it atomically makes <code>/sysroot</code> the new root (<code>/</code>), and the old initramfs root becomes unreachable. After pivot_root, the kernel executes the real <code>/usr/lib/systemd/systemd</code> as PID 1.</p>
+<p>The initramfs is now gone from the filesystem tree. (It remains in RAM but its memory is reclaimed.)</p>
+<hr />
+<h2 id="phase-5--systemd-the-init-system"><a class="header" href="#phase-5--systemd-the-init-system">Phase 5 — systemd: The Init System</a></h2>
+<h3 id="pid-1s-job"><a class="header" href="#pid-1s-job">PID 1's job</a></h3>
+<p><code>systemd</code> is now PID 1. This is significant: PID 1 is special in Linux. It is the parent of all orphaned processes (any process whose parent dies gets reparented to PID 1). It cannot be killed with <code>SIGKILL</code>. If it crashes, the kernel panics.</p>
+<p>systemd's core job is to <strong>start services in the right order as fast as possible</strong>. It reads <strong>unit files</strong> — declarative descriptions of what to start and what it depends on.</p>
+<h3 id="units-and-targets"><a class="header" href="#units-and-targets">Units and targets</a></h3>
+<p>Everything in systemd is a <strong>unit</strong>. The most common types:</p>
+<div class="table-wrapper"><table><thead><tr><th>Unit type</th><th>Suffix</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Service</td><td><code>.service</code></td><td>A daemon or one-shot process</td></tr>
+<tr><td>Mount</td><td><code>.mount</code></td><td>A filesystem to mount</td></tr>
+<tr><td>Device</td><td><code>.device</code></td><td>A kernel device (auto-created from udev)</td></tr>
+<tr><td>Socket</td><td><code>.socket</code></td><td>A socket to listen on (for socket activation)</td></tr>
+<tr><td>Target</td><td><code>.target</code></td><td>A synchronization point (like a milestone)</td></tr>
+</tbody></table>
+</div>
+<p><strong>Targets</strong> are especially important — they replace the old concept of runlevels:</p>
+<pre><code class="language-bash">$ systemctl list-units --type=target --state=active
+  UNIT                   LOAD   ACTIVE SUB    DESCRIPTION
+  basic.target           loaded active active Basic System
+  cryptsetup.target      loaded active active Local Encrypted Volumes
+  getty.target           loaded active active Login Prompts
+  graphical.target       loaded active active Graphical Interface
+  local-fs.target        loaded active active Local File Systems
+  multi-user.target      loaded active active Multi-User System
+  network.target         loaded active active Network
+  sysinit.target         loaded active active System Initialization
+</code></pre>
+<p><code>graphical.target</code> is the final destination on a desktop system — it's reached when everything is ready.</p>
+<h3 id="the-dependency-graph"><a class="header" href="#the-dependency-graph">The dependency graph</a></h3>
+<p>systemd builds a dependency graph and walks it in parallel. The critical path to <code>graphical.target</code> on this machine:</p>
+<pre><code class="language-bash">$ systemd-analyze critical-chain
+graphical.target @12.194s
+└─multi-user.target @12.194s
+  └─plymouth-quit-wait.service @9.496s +2.697s
+    └─systemd-user-sessions.service @9.478s +11ms
+      └─remote-fs.target @9.460s
+        └─network.target @3.455s
+          └─wpa_supplicant.service @4.376s +31ms
+            └─basic.target @2.218s
+              └─dbus-broker.service @2.154s +46ms
+                └─sysinit.target @2.133s
+                  └─systemd-resolved.service @2.075s +57ms
+                    └─local-fs.target @1.927s
+                      └─boot-efi.mount @1.907s +19ms
+                        └─boot.mount @1.883s +23ms
+</code></pre>
+<p>Read this bottom-up: <code>boot.mount</code> must succeed before <code>local-fs.target</code>, which must complete before <code>systemd-tmpfiles-setup</code>, and so on up to <code>graphical.target</code>. The number after <code>@</code> is when the unit became active; the <code>+</code> number is how long it took to start.</p>
+<h3 id="what-sysinittarget-does"><a class="header" href="#what-sysinittarget-does">What sysinit.target does</a></h3>
+<p><code>sysinit.target</code> is the first major milestone — basic system setup. By the time it's reached:</p>
+<ul>
+<li><code>/proc</code>, <code>/sys</code>, <code>/dev</code> are all mounted</li>
+<li><code>udev</code> has run and populated <code>/dev</code> with device nodes</li>
+<li>The system clock is set</li>
+<li>Cryptographic volumes are open</li>
+<li><code>systemd-journald</code> is running (the journal)</li>
+</ul>
+<h3 id="socket-activation-starting-services-lazily"><a class="header" href="#socket-activation-starting-services-lazily">Socket activation: starting services lazily</a></h3>
+<p>One of systemd's clever tricks: <strong>socket activation</strong>. Instead of starting <code>dbus.service</code> immediately and waiting for it to be ready, systemd can:</p>
+<ol>
+<li>Create and bind the D-Bus socket immediately (instant)</li>
+<li>Queue any messages sent to that socket</li>
+<li>Start <code>dbus-broker.service</code> only when something actually connects</li>
+<li>Deliver the queued messages once the service is ready</li>
+</ol>
+<p>Callers don't see a delay — from their perspective the socket was always there. This is how systemd achieves fast parallel startup: almost everything can start "at the same time" without actually racing.</p>
+<hr />
+<h2 id="phase-6--login-and-your-shell"><a class="header" href="#phase-6--login-and-your-shell">Phase 6 — Login and Your Shell</a></h2>
+<h3 id="getty-and-the-tty"><a class="header" href="#getty-and-the-tty">getty and the TTY</a></h3>
+<p>Once <code>multi-user.target</code> is reached, <code>systemd</code> starts <strong>getty</strong> processes. A getty (get tty) opens a terminal device, prints the login prompt, and waits for input.</p>
+<p>On a headless system you'd interact with <code>tty1–tty6</code>. On a desktop, a display manager (like GDM for GNOME) handles the graphical login instead.</p>
+<pre><code class="language-bash"># See which getty units are running
+systemctl status getty@tty1.service
+</code></pre>
+<h3 id="the-login-chain"><a class="header" href="#the-login-chain">The login chain</a></h3>
+<p>When you type your password at a text login:</p>
+<pre><code>getty (opens /dev/tty1, prints "login: ")
+    │
+    ▼
+login binary
+    │  calls PAM (Pluggable Authentication Modules)
+    │  PAM checks /etc/passwd, /etc/shadow, optionally LDAP, fingerprint, etc.
+    ▼
+user session created
+    │  PAM runs pam_systemd.so → registers session with systemd-logind
+    │  PAM runs pam_env.so → loads environment variables
+    │  login reads /etc/profile, sets HOME, SHELL, PATH
+    ▼
+exec $SHELL   ← your shell, finally
+</code></pre>
+<p>Your shell (bash, zsh, fish) sources its startup files (<code>~/.bashrc</code>, <code>~/.zshrc</code>, etc.) and you get a prompt. The boot is complete.</p>
+<hr />
+<h2 id="try-it-yourself"><a class="header" href="#try-it-yourself">Try It Yourself</a></h2>
+<p>Here are the commands that let you observe the boot sequence from inside a running system:</p>
+<h3 id="1-how-long-did-each-phase-take"><a class="header" href="#1-how-long-did-each-phase-take">1. How long did each phase take?</a></h3>
+<pre><code class="language-bash">systemd-analyze
+# Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
+#              + 15.109s (initrd) + 12.194s (userspace) = 37.501s
+</code></pre>
+<h3 id="2-what-took-the-longest-to-start"><a class="header" href="#2-what-took-the-longest-to-start">2. What took the longest to start?</a></h3>
+<pre><code class="language-bash">systemd-analyze blame | head -20
+</code></pre>
+<h3 id="3-visualize-the-dependency-graph"><a class="header" href="#3-visualize-the-dependency-graph">3. Visualize the dependency graph</a></h3>
+<pre><code class="language-bash"># Generate an SVG of the full boot dependency graph
+systemd-analyze plot &gt; boot.svg
+# Open with a browser or image viewer
+</code></pre>
+<h3 id="4-whats-in-your-initramfs"><a class="header" href="#4-whats-in-your-initramfs">4. What's in your initramfs?</a></h3>
+<pre><code class="language-bash">lsinitrd /boot/initramfs-$(uname -r).img | less
+</code></pre>
+<h3 id="5-what-did-the-kernel-print-during-boot"><a class="header" href="#5-what-did-the-kernel-print-during-boot">5. What did the kernel print during boot?</a></h3>
+<pre><code class="language-bash"># Current boot
+dmesg | less
+
+# With timestamps as wall clock time
+dmesg -T | less
+
+# Stored in the journal (survives reboots)
+journalctl -b 0       # this boot
+journalctl -b -1      # previous boot
+journalctl -b -1 -p err   # only errors from last boot
+</code></pre>
+<h3 id="6-what-efi-boot-entries-exist"><a class="header" href="#6-what-efi-boot-entries-exist">6. What EFI boot entries exist?</a></h3>
+<pre><code class="language-bash">efibootmgr -v
+</code></pre>
+<h3 id="7-examine-the-kernel-image-itself"><a class="header" href="#7-examine-the-kernel-image-itself">7. Examine the kernel image itself</a></h3>
+<pre><code class="language-bash">file /boot/vmlinuz-$(uname -r)
+# Linux kernel x86 boot executable, bzImage, ZST compressed ...
+</code></pre>
+<h3 id="8-what-was-the-actual-kernel-command-line"><a class="header" href="#8-what-was-the-actual-kernel-command-line">8. What was the actual kernel command line?</a></h3>
+<pre><code class="language-bash">cat /proc/cmdline
+</code></pre>
+<h3 id="9-trace-a-single-boot-unit"><a class="header" href="#9-trace-a-single-boot-unit">9. Trace a single boot unit</a></h3>
+<pre><code class="language-bash"># See exactly when and how a unit started
+systemd-analyze critical-chain NetworkManager.service
+
+# See the log output from a unit during boot
+journalctl -b -u NetworkManager.service
+</code></pre>
+<h3 id="10-profile-a-specific-unit"><a class="header" href="#10-profile-a-specific-unit">10. Profile a specific unit</a></h3>
+<pre><code class="language-bash">systemd-analyze blame | grep -i luks
+# If LUKS is slow, this shows up in the blame list
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together"><a class="header" href="#putting-it-all-together">Putting It All Together</a></h2>
+<p>Let's revisit the original diagram, but now with the full picture filled in:</p>
+<pre><code>Power on
+    │
+    ▼  UEFI firmware runs POST
+       Reads EFI variable: boot entry 0005 → \EFI\FEDORA\SHIM.EFI
+       Loads shim.efi (Microsoft-signed), verifies signature
+       shim loads grubx64.efi (Red Hat-signed), verifies signature
+    │
+    ▼  GRUB2 reads /boot/grub2/grub.cfg
+       Presents boot menu (1 second timeout on this machine)
+       Loads vmlinuz-6.19.11 and initramfs-6.19.11.img into RAM
+       Sets kernel command line
+       Calls EFI handoff entry point in vmlinuz
+    │
+    ▼  Kernel decompresses itself (ZST → vmlinux in RAM)
+       Processes e820 memory map from UEFI
+       start_kernel(): initializes mm, scheduler, IRQs, console
+       Mounts initramfs as root filesystem
+       Spawns PID 1 (kernel_init) and PID 2 (kthreadd)
+    │
+    ▼  initramfs systemd runs
+       Finds LUKS container (UUID: 5ea459ba-...)
+       Prompts for passphrase / unseals TPM key
+       cryptsetup luksOpen → creates /dev/mapper/luks-...
+       Mounts Btrfs filesystem, subvolume "root", at /sysroot
+       pivot_root: /sysroot becomes new /
+       Exec real /usr/lib/systemd/systemd
+    │
+    ▼  systemd (PID 1) reads unit files
+       Builds dependency graph
+       Starts sysinit.target in parallel
+       Starts local-fs.target, network.target, ...
+       Reaches multi-user.target, then graphical.target
+    │
+    ▼  GDM (display manager) starts
+       OR getty opens /dev/tty1
+       login → PAM authentication
+       Session registered with systemd-logind
+       Exec bash/zsh/fish
+    │
+    ▼
+$ _
+</code></pre>
+<p>Every character in that <code>$ _</code> represents a chain of decisions made by UEFI, GRUB, the kernel, dracut, and systemd — all working together, most of it in well under a minute.</p>
+<hr />
+<h2 id="whats-next"><a class="header" href="#whats-next">What's Next</a></h2>
+<p>In the next post, we'll go deeper into something <code>start_kernel()</code> sets up: <strong>processes</strong>. What is a process really? What does the kernel actually store for each one? How does <code>fork()</code> work at the kernel level? And how does the scheduler decide which process runs next?</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

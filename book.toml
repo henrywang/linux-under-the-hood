@@ -1,0 +1,10 @@
+[book]
+title = "Linux Under the Hood"
+authors = ["Xiaofeng"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/xiaofeng-xu/linux-under-the-hood"
+edit-url-template = "https://github.com/xiaofeng-xu/linux-under-the-hood/edit/main/src/{path}"

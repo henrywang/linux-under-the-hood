@@ -2,7 +2,7 @@
 
 A developer's deep dive into Linux internals — from boot sequence to kernel scheduler, memory management, filesystems, networking, and containers.
 
-**Read the book:** https://YOUR_USERNAME.github.io/linux-under-the-hood
+**Read the book:** https://henrywang.github.io/linux-under-the-hood
 
 ## Contents
 

@@ -116,6 +116,8 @@ grubx64.efi       ← signed by Red Hat
 vmlinuz            ← signed by Red Hat
 ```
 
+Without Secure Boot enabled, UEFI loads `grubx64.efi` directly — the shim is unnecessary and the chain is one step shorter.
+
 You can inspect the ESP yourself (you'll need root):
 
 ```bash
@@ -346,7 +348,7 @@ rd.luks.uuid=luks-5ea459ba-b7ec-439a-a3cf-7d25ff3b2889
 3. Use `cryptsetup luksOpen` to create a decrypted device mapper device
 4. Then mount *that* device as root
 
-This is why initramfs took **15 seconds** on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key).
+This is why initramfs took **15 seconds** on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key). On an unencrypted system, initramfs skips the LUKS step entirely, and this phase drops from ~15s to ~2s. The initramfs image is also much smaller since `cryptsetup` and its dependencies aren't needed.
 
 ### pivot_root: switching to the real root
 

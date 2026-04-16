@@ -290,6 +290,7 @@ grubx64.efi       ← signed by Red Hat
     ▼
 vmlinuz            ← signed by Red Hat
 </code></pre>
+<p>Without Secure Boot enabled, UEFI loads <code>grubx64.efi</code> directly — the shim is unnecessary and the chain is one step shorter.</p>
 <p>You can inspect the ESP yourself (you'll need root):</p>
 <pre><code class="language-bash"># The ESP is mounted at /boot/efi
 ls /boot/efi/EFI/fedora/
@@ -459,7 +460,7 @@ lsinitrd /boot/initramfs-$(uname -r).img | grep 'dracut module'
 <li>Use <code>cryptsetup luksOpen</code> to create a decrypted device mapper device</li>
 <li>Then mount <em>that</em> device as root</li>
 </ol>
-<p>This is why initramfs took <strong>15 seconds</strong> on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key).</p>
+<p>This is why initramfs took <strong>15 seconds</strong> on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key). On an unencrypted system, initramfs skips the LUKS step entirely, and this phase drops from ~15s to ~2s. The initramfs image is also much smaller since <code>cryptsetup</code> and its dependencies aren't needed.</p>
 <h3 id="pivot_root-switching-to-the-real-root"><a class="header" href="#pivot_root-switching-to-the-real-root">pivot_root: switching to the real root</a></h3>
 <p>Once the real root filesystem is mounted (say, at <code>/sysroot</code> within the initramfs), the kernel performs a <strong>pivot_root</strong> operation: it atomically makes <code>/sysroot</code> the new root (<code>/</code>), and the old initramfs root becomes unreachable. After pivot_root, the kernel executes the real <code>/usr/lib/systemd/systemd</code> as PID 1.</p>
 <p>The initramfs is now gone from the filesystem tree. (It remains in RAM but its memory is reclaimed.)</p>

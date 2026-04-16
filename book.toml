@@ -6,5 +6,5 @@ src = "src"
 
 [output.html]
 default-theme = "navy"
-git-repository-url = "https://github.com/xiaofeng-xu/linux-under-the-hood"
-edit-url-template = "https://github.com/xiaofeng-xu/linux-under-the-hood/edit/main/src/{path}"
+git-repository-url = "https://github.com/henrywang/linux-under-the-hood"
+edit-url-template = "https://github.com/henrywang/linux-under-the-hood/edit/main/src/{path}"

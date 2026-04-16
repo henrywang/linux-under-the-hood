@@ -89,7 +89,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded affix "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Part I — The System Starts</li><li class="chapter-item expanded "><a href="01-boot-sequence.html"><strong aria-hidden="true">1.</strong> The Boot Sequence</a></li><li class="chapter-item expanded affix "><li class="part-title">Part II — Processes & Memory (coming soon)</li><li class="chapter-item expanded affix "><li class="part-title">Part III — Filesystem & I/O (coming soon)</li><li class="chapter-item expanded affix "><li class="part-title">Part IV — Networking & Security (coming soon)</li></ol>
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Part I — The System Starts</li><li class="chapter-item expanded "><a href="01-boot-sequence.html"><strong aria-hidden="true">1.</strong> The Boot Sequence</a></li><li class="chapter-item expanded "><a href="02-systemd.html"><strong aria-hidden="true">2.</strong> systemd Deep Dive</a></li><li class="chapter-item expanded affix "><li class="part-title">Part II — Processes & Memory</li><li class="chapter-item expanded "><a href="03-processes.html"><strong aria-hidden="true">3.</strong> Processes: fork, exec, and the Process Table</a></li><li class="chapter-item expanded "><a href="04-memory.html"><strong aria-hidden="true">4.</strong> Memory Management: Virtual Memory and the Page Cache</a></li><li class="chapter-item expanded "><a href="05-scheduler.html"><strong aria-hidden="true">5.</strong> The Scheduler: How the Kernel Decides What Runs</a></li><li class="chapter-item expanded affix "><li class="part-title">Part III — Filesystem & I/O</li><li class="chapter-item expanded "><a href="06-vfs.html"><strong aria-hidden="true">6.</strong> The VFS Layer: How Linux Abstracts Filesystems</a></li><li class="chapter-item expanded "><a href="07-btrfs.html"><strong aria-hidden="true">7.</strong> Btrfs: Snapshots, Subvolumes, and CoW</a></li><li class="chapter-item expanded "><a href="08-block-io.html"><strong aria-hidden="true">8.</strong> Block I/O: From read() to the Disk</a></li><li class="chapter-item expanded affix "><li class="part-title">Part IV — Image-Based Systems</li><li class="chapter-item expanded "><a href="09-composefs.html"><strong aria-hidden="true">9.</strong> composefs: Composing Read-Only Filesystems</a></li><li class="chapter-item expanded "><a href="10-ostree.html"><strong aria-hidden="true">10.</strong> ostree: Immutable Trees and Atomic Updates</a></li><li class="chapter-item expanded "><a href="11-rpm-ostree.html"><strong aria-hidden="true">11.</strong> rpm-ostree: Layering Packages on an Immutable Base</a></li><li class="chapter-item expanded "><a href="12-bootc.html"><strong aria-hidden="true">12.</strong> bootc: The OS as a Container Image</a></li><li class="chapter-item expanded affix "><li class="part-title">Part V — Networking & Security</li><li class="chapter-item expanded "><a href="13-networkmanager.html"><strong aria-hidden="true">13.</strong> NetworkManager: From Interface Detection to IP Address</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -254,7 +254,12 @@
 Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
                  + 15.109s (initrd) + 12.194s (userspace) = 37.501s
 </code></pre>
-<p>Systemd measures and records every phase. The kernel literally timestamps when it hands off to initramfs, and systemd records when it took over. We'll use this throughout.</p>
+<p>How does <code>systemd-analyze</code> know these numbers? Each phase boundary is a measured handoff, not an estimate:</p>
+<ul>
+<li><strong>Kernel phase</strong>: When the kernel finishes its initialization and mounts the initramfs as the root filesystem, it records a timestamp to the monotonic clock. This marks the end of the "kernel" phase and the start of the "initrd" phase.</li>
+<li><strong>initrd and userspace phases</strong>: When systemd starts running (first inside initramfs, then as the real PID 1 after <code>pivot_root</code>), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.</li>
+</ul>
+<p>We'll use this data throughout.</p>
 <hr />
 <h2 id="phase-1--uefi-firmware"><a class="header" href="#phase-1--uefi-firmware">Phase 1 — UEFI Firmware</a></h2>
 <h3 id="what-bios-used-to-do"><a class="header" href="#what-bios-used-to-do">What BIOS used to do</a></h3>
@@ -296,8 +301,10 @@ vmlinuz            ← signed by Red Hat
 ls /boot/efi/EFI/fedora/
 # shim.efi  shimx64.efi  grubx64.efi  grub.cfg  ...
 </code></pre>
+<p><strong><code>/boot</code> vs <code>/boot/efi</code> — a common point of confusion.</strong> These are two different things. <code>/boot</code> is a regular directory (or sometimes its own partition) on your root filesystem — it holds kernels, initramfs images, and GRUB config files, typically on ext4 or Btrfs. <code>/boot/efi</code> is where the ESP is <em>mounted</em> — it's a separate FAT32 partition (FAT32 is required by the UEFI spec) that contains the <code>.efi</code> bootloader binaries. So when you see <code>/boot/efi/EFI/fedora/shim.efi</code>, you're looking at a file on the FAT32 ESP partition, not on your root filesystem.</p>
+<p>Most distros (Fedora, Debian, Ubuntu) mount the ESP at <code>/boot/efi</code>. Arch Linux often mounts the ESP directly at <code>/boot</code>, which works fine for single-boot setups. If you're dual-booting or sharing a machine with a Debian-based distro, use <code>/boot/efi</code> as the ESP mount point to avoid conflicts — different distros have different expectations about what lives in <code>/boot</code>.</p>
 <h3 id="what-uefi-hands-to-grub"><a class="header" href="#what-uefi-hands-to-grub">What UEFI hands to GRUB</a></h3>
-<p>UEFI doesn't just load GRUB and forget it. It passes a <strong>handoff structure</strong> containing:</p>
+<p>UEFI doesn't just load GRUB and forget it. UEFI hands control to GRUB by locating and executing the <code>grubx64.efi</code> application (or <code>shimx64.efi</code> for Secure Boot) stored on the FAT32-formatted ESP. It passes a <strong>handoff structure</strong> containing:</p>
 <ul>
 <li>The memory map (what physical RAM exists and which regions are usable)</li>
 <li>A pointer to the UEFI runtime services (which the kernel uses later for things like <code>efivarfs</code>)</li>
@@ -337,6 +344,26 @@ BOOT_IMAGE=(hd0,gpt2)/vmlinuz-6.19.11-200.fc43.x86_64
 </tbody></table>
 </div>
 <p>This one command line tells the whole story of this machine's storage setup: there's a Btrfs filesystem inside a LUKS-encrypted container, and the bootable root is a subvolume within it.</p>
+<h3 id="who-actually-reads-the-command-line"><a class="header" href="#who-actually-reads-the-command-line">Who actually reads the command line?</a></h3>
+<p>The kernel command line is a single string, but it's consumed by multiple components. You might wonder: how does <code>rd.luks.uuid</code> end up in the initramfs while <code>quiet</code> goes to the kernel? The answer is a filtering hierarchy:</p>
+<ol>
+<li>
+<p><strong>Known kernel parameters</strong>: If the kernel recognizes the string (<code>root=</code>, <code>ro</code>, <code>quiet</code>, etc.), it uses it to configure itself during <code>start_kernel()</code>.</p>
+</li>
+<li>
+<p><strong>Module parameters</strong>: If the string contains a dot (e.g., <code>nvidia.modeset=1</code>), the kernel treats the part before the dot as a module name and passes the value to that module when it loads.</p>
+</li>
+<li>
+<p><strong>initramfs directives</strong>: Parameters prefixed with <code>rd.*</code> are conventions established by dracut. The kernel doesn't interpret them — dracut's scripts inside the initramfs read <code>/proc/cmdline</code> and act on the ones they recognize (like <code>rd.luks.uuid</code>).</p>
+</li>
+<li>
+<p><strong>systemd parameters</strong>: systemd also reads <code>/proc/cmdline</code> when it starts. Parameters like <code>systemd.unit=multi-user.target</code> or <code>systemd.log_level=debug</code> let you configure PID 1 from the bootloader.</p>
+</li>
+<li>
+<p><strong>The unknowns</strong>: Historically, any parameter not recognized by the kernel and not containing a dot was passed to PID 1 as an environment variable. Modern systemd is stricter about this for security reasons — it won't turn arbitrary strings into <code>$VARIABLES</code>. If you need to set an environment variable via the command line, use the explicit <code>systemd.setenv=VAR=VALUE</code> syntax.</p>
+</li>
+</ol>
+<p>The whole thing works because <code>/proc/cmdline</code> is readable by anyone — every component just picks out the parameters it cares about and ignores the rest.</p>
 <h3 id="what-grub-loads"><a class="header" href="#what-grub-loads">What GRUB loads</a></h3>
 <p>GRUB reads two files from <code>/boot</code> and loads them into RAM:</p>
 <ol>
@@ -350,6 +377,16 @@ $ ls -lh /boot/initramfs-6.19.11-200.fc43.x86_64.img
 -rw-------. 1 root root 70M Apr  2 21:22 /boot/initramfs-6.19.11-200.fc43.x86_64.img
 </code></pre>
 <p>Once both are in RAM, GRUB jumps to the kernel's entry point. GRUB is done.</p>
+<h3 id="what-about-systemd-boot"><a class="header" href="#what-about-systemd-boot">What about systemd-boot?</a></h3>
+<p>GRUB2 isn't the only bootloader in the Linux world. <strong>systemd-boot</strong> (formerly known as gummiboot) is a simpler alternative that's gaining adoption — Arch Linux, some Ubuntu configurations, and Fedora all support it.</p>
+<p>The key differences from GRUB2:</p>
+<ul>
+<li><strong>No scripting language or config generator.</strong> GRUB2 has its own shell, scripting, and <code>grub2-mkconfig</code>. systemd-boot has none of that — it reads simple drop-in files directly.</li>
+<li><strong>Uses the Boot Loader Specification (BLS).</strong> Each kernel gets a small <code>.conf</code> file in the ESP (typically under <code>loader/entries/</code>) that lists the kernel path, initramfs path, and command line options. Adding a kernel means dropping a file; removing one means deleting it.</li>
+<li><strong>Lives entirely on the ESP.</strong> GRUB2 reads from both the ESP and <code>/boot</code> (a separate partition). systemd-boot reads everything from the ESP's FAT32 filesystem.</li>
+<li><strong>No theming or interactive shell.</strong> It shows a plain menu and boots. That's it.</li>
+</ul>
+<p>This machine uses GRUB2, so that's what we trace in this post. But if you run <code>bootctl status</code> and see output instead of an error, your system is using systemd-boot — the handoff to the kernel works the same way, just with less machinery in between.</p>
 <hr />
 <h2 id="phase-3--kernel-initialization"><a class="header" href="#phase-3--kernel-initialization">Phase 3 — Kernel Initialization</a></h2>
 <h3 id="vmlinuz-whats-actually-in-that-file"><a class="header" href="#vmlinuz-whats-actually-in-that-file">vmlinuz: what's actually in that file</a></h3>
@@ -657,6 +694,414 @@ $ _
 <p>In the next post, we'll go deeper into something <code>start_kernel()</code> sets up: <strong>processes</strong>. What is a process really? What does the kernel actually store for each one? How does <code>fork()</code> work at the kernel level? And how does the scheduler decide which process runs next?</p>
 <hr />
 <p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-2-systemd--the-init-system-and-beyond"><a class="header" href="#linux-deep-dive-2-systemd--the-init-system-and-beyond">Linux Deep Dive #2: systemd — The Init System and Beyond</a></h1>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>The boot sequence chapter ended with systemd becoming PID 1. But that was just the handoff. What does systemd actually <em>do</em> once it's in charge?</p>
+<p>The short answer: everything. systemd is not just an init system — it's a suite of components that manages services, mounts filesystems, handles logging, schedules jobs, tracks login sessions, and enforces resource limits. Understanding it is understanding how a modern Linux system is organized.</p>
+<hr />
+<h2 id="why-pid-1-is-special"><a class="header" href="#why-pid-1-is-special">Why PID 1 Is Special</a></h2>
+<p>Before diving into systemd, it's worth understanding why PID 1 matters at all.</p>
+<p>In Linux, every process has a parent. When a parent process dies, its children are <strong>reparented</strong> — adopted by PID 1. This makes PID 1 the universal parent of all orphaned processes. It's also the only process that cannot be killed with <code>SIGKILL</code>. If PID 1 dies, the kernel panics. The whole system depends on it staying alive and responsive.</p>
+<p>The traditional Unix init (SysV init) was simple: a shell script runner that started services sequentially from <code>/etc/rc.d/</code>. Each service started only after the previous one finished. On modern hardware with many services, this was slow. It also had no standard way to track whether a service was actually running, restart it if it crashed, or collect its logs.</p>
+<p>systemd was designed to fix all of this.</p>
+<hr />
+<h2 id="the-unit-systemds-fundamental-building-block"><a class="header" href="#the-unit-systemds-fundamental-building-block">The Unit: systemd's Fundamental Building Block</a></h2>
+<p>Everything in systemd is described by a <strong>unit file</strong> — a declarative INI-style text file that tells systemd what something is, what it needs, and how to manage it.</p>
+<h3 id="anatomy-of-a-unit-file"><a class="header" href="#anatomy-of-a-unit-file">Anatomy of a unit file</a></h3>
+<p>Here's the real unit file for <code>sshd</code> on this Fedora machine:</p>
+<pre><code class="language-ini">[Unit]
+Description=OpenSSH server daemon
+Documentation=man:sshd(8) man:sshd_config(5)
+After=network.target sshd-keygen.target
+Wants=sshd-keygen.target
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/sysconfig/sshd
+ExecStart=/usr/sbin/sshd -D $OPTIONS
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=42s
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>Every unit file has the same three-section structure:</p>
+<p><strong><code>[Unit]</code></strong> — metadata and dependencies. The most important directives:</p>
+<div class="table-wrapper"><table><thead><tr><th>Directive</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Description=</code></td><td>Human-readable name shown in <code>systemctl status</code></td></tr>
+<tr><td><code>After=</code></td><td>Start this unit only <em>after</em> these units are active</td></tr>
+<tr><td><code>Before=</code></td><td>Start this unit <em>before</em> these units</td></tr>
+<tr><td><code>Wants=</code></td><td>Weak dependency: try to start these, but don't fail if they don't start</td></tr>
+<tr><td><code>Requires=</code></td><td>Hard dependency: if these fail, this unit fails too</td></tr>
+<tr><td><code>BindsTo=</code></td><td>Like <code>Requires=</code>, but also stop this unit if the dependency stops</td></tr>
+</tbody></table>
+</div>
+<p><strong><code>[Service]</code></strong> (or <code>[Timer]</code>, <code>[Socket]</code>, etc.) — how to run it:</p>
+<div class="table-wrapper"><table><thead><tr><th>Directive</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Type=notify</code></td><td>The process signals systemd when it's fully ready (via <code>sd_notify()</code>)</td></tr>
+<tr><td><code>ExecStart=</code></td><td>The command to run</td></tr>
+<tr><td><code>ExecReload=</code></td><td>How to reload config without restarting</td></tr>
+<tr><td><code>Restart=on-failure</code></td><td>Automatically restart if the process exits with a non-zero status</td></tr>
+<tr><td><code>RestartSec=42s</code></td><td>Wait 42 seconds before restarting</td></tr>
+<tr><td><code>KillMode=process</code></td><td>Only kill the main process on stop, not its children</td></tr>
+</tbody></table>
+</div>
+<p><strong><code>[Install]</code></strong> — when to activate this unit:</p>
+<div class="table-wrapper"><table><thead><tr><th>Directive</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>WantedBy=multi-user.target</code></td><td>Enable this unit when <code>multi-user.target</code> is enabled</td></tr>
+</tbody></table>
+</div>
+<p>The <code>[Install]</code> section only matters for <code>systemctl enable</code> — it's how systemd knows which target to hook a unit into.</p>
+<h3 id="where-unit-files-live"><a class="header" href="#where-unit-files-live">Where unit files live</a></h3>
+<p>systemd loads unit files from several locations, in priority order:</p>
+<pre><code>/etc/systemd/system/        ← administrator overrides (highest priority)
+/run/systemd/system/        ← runtime-generated units
+/usr/lib/systemd/system/    ← vendor/package-provided units (lowest priority)
+</code></pre>
+<p>If you want to override a vendor unit, don't edit <code>/usr/lib/</code> directly — create a <strong>drop-in</strong> file:</p>
+<pre><code class="language-bash"># Create a drop-in directory for the sshd service
+mkdir -p /etc/systemd/system/sshd.service.d/
+
+# Write an override — only the directives you want to change
+cat &gt; /etc/systemd/system/sshd.service.d/override.conf &lt;&lt; 'EOF'
+[Service]
+RestartSec=10s
+EOF
+
+# Tell systemd to reload its config
+systemctl daemon-reload
+</code></pre>
+<p>Drop-ins are merged with the original unit file. Your changes survive package updates.</p>
+<hr />
+<h2 id="unit-types"><a class="header" href="#unit-types">Unit Types</a></h2>
+<p>systemd has several unit types, each with its own suffix and section:</p>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Suffix</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Service</td><td><code>.service</code></td><td>A daemon or one-shot process</td></tr>
+<tr><td>Socket</td><td><code>.socket</code></td><td>A socket for socket activation</td></tr>
+<tr><td>Timer</td><td><code>.timer</code></td><td>A scheduled job (cron replacement)</td></tr>
+<tr><td>Mount</td><td><code>.mount</code></td><td>A filesystem mount point</td></tr>
+<tr><td>Device</td><td><code>.device</code></td><td>A kernel device (auto-generated from udev)</td></tr>
+<tr><td>Target</td><td><code>.target</code></td><td>A synchronization milestone</td></tr>
+<tr><td>Path</td><td><code>.path</code></td><td>Trigger a service when a path changes</td></tr>
+<tr><td>Slice</td><td><code>.slice</code></td><td>A cgroup resource boundary</td></tr>
+<tr><td>Scope</td><td><code>.scope</code></td><td>A group of externally-started processes</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="dependencies-and-targets"><a class="header" href="#dependencies-and-targets">Dependencies and Targets</a></h2>
+<h3 id="the-dependency-graph-1"><a class="header" href="#the-dependency-graph-1">The dependency graph</a></h3>
+<p>When systemd starts, it doesn't just run services one by one. It builds a <strong>dependency graph</strong> from all unit files, then walks the graph in parallel — starting everything it can simultaneously, waiting only where ordering (<code>After=</code>/<code>Before=</code>) requires it.</p>
+<p>The key insight: <code>Wants=</code>/<code>Requires=</code> express <em>what</em> must exist, while <code>After=</code>/<code>Before=</code> express <em>when</em> to start it. These are orthogonal. A unit can require another without ordering itself after it (they'd start in parallel), or be ordered after something it doesn't strictly require.</p>
+<h3 id="targets-as-milestones"><a class="header" href="#targets-as-milestones">Targets as milestones</a></h3>
+<p><strong>Targets</strong> are units with no <code>[Service]</code> section — they're pure synchronization points. Other units declare <code>WantedBy=some.target</code>, and systemd activates those units when pulling in that target.</p>
+<p>This replaces the old SysV concept of <strong>runlevels</strong> (single-user, multi-user, graphical, etc.). The mapping:</p>
+<div class="table-wrapper"><table><thead><tr><th>SysV runlevel</th><th>systemd target</th></tr></thead><tbody>
+<tr><td>1</td><td><code>rescue.target</code></td></tr>
+<tr><td>3</td><td><code>multi-user.target</code></td></tr>
+<tr><td>5</td><td><code>graphical.target</code></td></tr>
+<tr><td>6</td><td><code>reboot.target</code></td></tr>
+</tbody></table>
+</div>
+<p>On this machine, <code>graphical.target</code> is the default — it pulls in <code>multi-user.target</code>, which pulls in hundreds of other units:</p>
+<pre><code class="language-bash">$ systemctl get-default
+graphical.target
+
+$ systemctl list-dependencies graphical.target | head -20
+graphical.target
+● ├─accounts-daemon.service
+● ├─gdm.service
+● ├─rtkit-daemon.service
+● ├─systemd-update-utmp-runlevel.service
+● └─multi-user.target
+●   ├─atd.service
+●   ├─auditd.service
+●   ├─avahi-daemon.service
+●   ├─chronyd.service
+●   ├─crond.service
+●   ├─dbus-broker.service
+...
+</code></pre>
+<p>To switch to a different target temporarily (without rebooting):</p>
+<pre><code class="language-bash"># Drop to multi-user (no graphical session)
+systemctl isolate multi-user.target
+
+# Enter emergency shell
+systemctl isolate emergency.target
+</code></pre>
+<hr />
+<h2 id="service-lifecycle"><a class="header" href="#service-lifecycle">Service Lifecycle</a></h2>
+<p>A service unit can be in several states. The full lifecycle:</p>
+<pre><code>inactive
+    │
+    │  systemctl start
+    ▼
+activating   ← ExecStartPre= commands running
+    │
+    │  ExecStart= process running, waiting for ready signal
+    ▼
+active (running)
+    │
+    │  systemctl stop  OR  process exits unexpectedly
+    ▼
+deactivating  ← ExecStopPost= commands running
+    │
+    ▼
+inactive  (or → failed if it crashed and Restart= doesn't apply)
+</code></pre>
+<p>You can inspect this at any time:</p>
+<pre><code class="language-bash">$ systemctl status NetworkManager.service
+● NetworkManager.service - Network Manager
+     Loaded: loaded (/usr/lib/systemd/system/NetworkManager.service; enabled; preset: enabled)
+     Active: active (running) since Wed 2026-04-16 13:44:57 CST; 1h 20min ago
+   Main PID: 1618 (NetworkManager)
+      Tasks: 4 (limit: 37682)
+     Memory: 12.2M
+        CPU: 1.107s
+     CGroup: /system.slice/NetworkManager.service
+             └─1618 /usr/bin/NetworkManager --no-daemon
+</code></pre>
+<p>The key fields: <code>Loaded</code> (was the unit file found and parsed?), <code>Active</code> (is it running?), <code>Main PID</code> (what process is it?), <code>CGroup</code> (where in the cgroup hierarchy does it live?).</p>
+<h3 id="service-types"><a class="header" href="#service-types">Service types</a></h3>
+<p>The <code>Type=</code> directive controls how systemd knows a service is "ready":</p>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>How systemd knows it's ready</th></tr></thead><tbody>
+<tr><td><code>simple</code></td><td>Immediately after <code>ExecStart=</code> forks (default)</td></tr>
+<tr><td><code>notify</code></td><td>The process calls <code>sd_notify(READY=1)</code></td></tr>
+<tr><td><code>dbus</code></td><td>The process acquires a D-Bus name</td></tr>
+<tr><td><code>forking</code></td><td>The process forks and the parent exits (old-style daemons)</td></tr>
+<tr><td><code>oneshot</code></td><td>The process runs to completion and exits</td></tr>
+<tr><td><code>idle</code></td><td>Like <code>simple</code>, but delays start until all jobs are dispatched</td></tr>
+</tbody></table>
+</div>
+<p><code>notify</code> is preferred for modern daemons — it means systemd actually <em>knows</em> the service is ready to accept connections, not just that it started.</p>
+<hr />
+<h2 id="socket-activation"><a class="header" href="#socket-activation">Socket Activation</a></h2>
+<p>One of systemd's most useful features: <strong>socket activation</strong>. Instead of starting a service immediately and waiting for it to be ready, systemd can:</p>
+<ol>
+<li>Create and bind the socket <em>before</em> the service starts (instant)</li>
+<li>Queue any incoming connections</li>
+<li>Start the service only when something actually connects</li>
+<li>Hand the socket's file descriptor to the service process</li>
+</ol>
+<p>From a client's perspective, the socket is always there. The service only actually starts when needed.</p>
+<p>The D-Bus socket is the canonical example. Here's its socket unit:</p>
+<pre><code class="language-ini"># /usr/lib/systemd/system/dbus.socket
+[Unit]
+Description=D-Bus System Message Bus Socket
+
+[Socket]
+ListenStream=/run/dbus/system_bus_socket
+
+[Install]
+WantedBy=sockets.target
+</code></pre>
+<p>systemd creates <code>/run/dbus/system_bus_socket</code> at boot (part of <code>sockets.target</code>, which is reached very early). The actual <code>dbus-broker.service</code> only starts when something tries to connect. This is why D-Bus is available the moment any service needs it, without serializing on <code>dbus-broker.service</code> startup.</p>
+<p>Socket activation also enables <strong>parallel startup without races</strong>: two services that both need D-Bus can start simultaneously, because they'll both see the socket immediately and block until dbus-broker is ready.</p>
+<hr />
+<h2 id="timers-the-cron-replacement"><a class="header" href="#timers-the-cron-replacement">Timers: The cron Replacement</a></h2>
+<p>systemd timers replace <code>cron</code> for scheduling recurring jobs. They have two parts: a <code>.timer</code> unit (the schedule) and a matching <code>.service</code> unit (what to run).</p>
+<p>Here's a real timer on this system:</p>
+<pre><code class="language-bash">$ systemctl list-timers
+UNIT                         NEXT                            LEFT
+dnf-makecache.timer          Thu 2026-04-16 22:12:09 CST     7h left
+fstrim.timer                 Mon 2026-04-20 00:00:00 CST     3 days left
+logrotate.timer              Thu 2026-04-17 00:00:00 CST     9h left
+plocate-updatedb.timer       Thu 2026-04-17 00:00:00 CST     9h left
+systemd-tmpfiles-clean.timer Thu 2026-04-17 00:23:36 CST     9h left
+</code></pre>
+<p>The <code>systemd-tmpfiles-clean.timer</code> unit:</p>
+<pre><code class="language-ini">[Unit]
+Description=Daily Cleanup of Temporary Directories
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1d
+</code></pre>
+<p><code>OnBootSec=15min</code> — run 15 minutes after boot. <code>OnUnitActiveSec=1d</code> — run again every 24 hours after that. No crontab syntax, no minute/hour/day columns to memorize.</p>
+<p>Timer directives:</p>
+<div class="table-wrapper"><table><thead><tr><th>Directive</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>OnBootSec=</code></td><td>Time after system boot</td></tr>
+<tr><td><code>OnUnitActiveSec=</code></td><td>Time after this timer last activated</td></tr>
+<tr><td><code>OnCalendar=</code></td><td>A calendar expression (like cron, but readable: <code>daily</code>, <code>weekly</code>, <code>Mon *-*-* 02:00:00</code>)</td></tr>
+<tr><td><code>Persistent=true</code></td><td>If the timer was missed (system was off), run immediately on next boot</td></tr>
+</tbody></table>
+</div>
+<p>The advantage over cron: the corresponding <code>.service</code> unit gets full systemd treatment — logging to the journal, resource limits, failure tracking.</p>
+<hr />
+<h2 id="journald-structured-logging"><a class="header" href="#journald-structured-logging">journald: Structured Logging</a></h2>
+<p>Traditional syslog wrote plain text to files. systemd-journald writes <strong>structured, binary logs</strong> with metadata attached to every message:</p>
+<ul>
+<li>Timestamp (microsecond precision)</li>
+<li>Unit name</li>
+<li>PID, UID, GID</li>
+<li>SELinux context</li>
+<li>Kernel boot ID (so you can distinguish logs from different boots)</li>
+</ul>
+<pre><code class="language-bash"># All logs from this boot
+journalctl -b 0
+
+# Logs from last boot
+journalctl -b -1
+
+# Follow logs in real time (like tail -f)
+journalctl -f
+
+# Only from one service
+journalctl -u NetworkManager.service
+
+# Only errors and worse
+journalctl -p err
+
+# Since a specific time
+journalctl --since "2026-04-16 13:00:00"
+
+# Kernel messages only (like dmesg)
+journalctl -k
+</code></pre>
+<p>The journal is queryable in ways plain text files aren't. You can filter by any metadata field:</p>
+<pre><code class="language-bash"># All messages from PID 1618
+journalctl _PID=1618
+
+# All messages with a specific syslog identifier
+journalctl SYSLOG_IDENTIFIER=NetworkManager
+</code></pre>
+<p>Journal files live in <code>/var/log/journal/</code> (persistent across reboots) or <code>/run/log/journal/</code> (volatile, lost on reboot). On this machine:</p>
+<pre><code class="language-bash">$ journalctl --disk-usage
+Archived and active journals take up 264.0M in the file system.
+</code></pre>
+<hr />
+<h2 id="cgroups-resource-isolation"><a class="header" href="#cgroups-resource-isolation">cgroups: Resource Isolation</a></h2>
+<p>Every service systemd manages runs inside a <strong>cgroup</strong> (control group) — a kernel mechanism for grouping processes and enforcing resource limits.</p>
+<p>You can see the cgroup hierarchy right now:</p>
+<pre><code class="language-bash">$ systemd-cgls
+CGroup /:
+-.slice
+├─system.slice
+│ ├─NetworkManager.service
+│ │ └─1618 /usr/bin/NetworkManager --no-daemon
+│ ├─dbus-broker.service
+│ │ └─1432 /usr/bin/dbus-broker ...
+│ └─...
+├─user.slice
+│ └─user-1000.slice
+│   └─user@1000.service
+│     └─...
+└─init.scope
+  └─1 /usr/lib/systemd/systemd
+</code></pre>
+<p>The tree reflects the systemd unit hierarchy:</p>
+<ul>
+<li><code>system.slice</code> — all system services</li>
+<li><code>user.slice</code> — all user sessions</li>
+<li><code>init.scope</code> — PID 1 itself</li>
+</ul>
+<p>Because each service has its own cgroup, systemd can:</p>
+<ul>
+<li><strong>Track all processes in a service</strong>, even ones the main process forked — no more daemons escaping their service</li>
+<li><strong>Kill a service cleanly</strong> — <code>SIGTERM</code> then <code>SIGKILL</code> to every process in the cgroup, not just the main PID</li>
+<li><strong>Enforce resource limits</strong> set in the unit file</li>
+</ul>
+<p>You can add resource limits directly in a unit's <code>[Service]</code> section:</p>
+<pre><code class="language-ini">[Service]
+MemoryMax=512M
+CPUQuota=25%
+TasksMax=100
+</code></pre>
+<p>This tells the kernel: this service gets at most 512MB RAM, 25% of one CPU core, and 100 processes/threads. No external tooling needed.</p>
+<hr />
+<h2 id="try-it-yourself-1"><a class="header" href="#try-it-yourself-1">Try It Yourself</a></h2>
+<h3 id="1-inspect-any-service"><a class="header" href="#1-inspect-any-service">1. Inspect any service</a></h3>
+<pre><code class="language-bash">systemctl status &lt;service-name&gt;
+
+# Examples:
+systemctl status NetworkManager.service
+systemctl status gdm.service
+</code></pre>
+<h3 id="2-follow-what-systemd-is-doing-right-now"><a class="header" href="#2-follow-what-systemd-is-doing-right-now">2. Follow what systemd is doing right now</a></h3>
+<pre><code class="language-bash">journalctl -f
+</code></pre>
+<h3 id="3-see-all-running-services-and-their-memorycpu"><a class="header" href="#3-see-all-running-services-and-their-memorycpu">3. See all running services and their memory/CPU</a></h3>
+<pre><code class="language-bash">systemctl list-units --type=service --state=running
+</code></pre>
+<h3 id="4-find-the-slowest-services-to-start"><a class="header" href="#4-find-the-slowest-services-to-start">4. Find the slowest services to start</a></h3>
+<pre><code class="language-bash">systemd-analyze blame
+</code></pre>
+<h3 id="5-trace-why-a-service-started"><a class="header" href="#5-trace-why-a-service-started">5. Trace why a service started</a></h3>
+<pre><code class="language-bash">systemd-analyze critical-chain &lt;service&gt;
+# Example:
+systemd-analyze critical-chain NetworkManager.service
+</code></pre>
+<h3 id="6-list-all-active-timers-and-when-they-next-fire"><a class="header" href="#6-list-all-active-timers-and-when-they-next-fire">6. List all active timers and when they next fire</a></h3>
+<pre><code class="language-bash">systemctl list-timers
+</code></pre>
+<h3 id="7-read-a-unit-file"><a class="header" href="#7-read-a-unit-file">7. Read a unit file</a></h3>
+<pre><code class="language-bash">systemctl cat sshd.service
+# Shows the file as loaded (including drop-ins)
+</code></pre>
+<h3 id="8-create-a-drop-in-override"><a class="header" href="#8-create-a-drop-in-override">8. Create a drop-in override</a></h3>
+<pre><code class="language-bash">systemctl edit sshd.service
+# Opens $EDITOR with the right drop-in path pre-created
+</code></pre>
+<h3 id="9-see-the-full-cgroup-tree"><a class="header" href="#9-see-the-full-cgroup-tree">9. See the full cgroup tree</a></h3>
+<pre><code class="language-bash">systemd-cgls
+</code></pre>
+<h3 id="10-query-structured-journal-fields"><a class="header" href="#10-query-structured-journal-fields">10. Query structured journal fields</a></h3>
+<pre><code class="language-bash"># List all journal fields you can filter on
+journalctl -F _SYSTEMD_UNIT
+
+# All log entries from NetworkManager, only errors
+journalctl -u NetworkManager.service -p err
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together-1"><a class="header" href="#putting-it-all-together-1">Putting It All Together</a></h2>
+<p>systemd's design reflects a single philosophy: <strong>everything is a unit, everything is tracked, everything is declared</strong>. Rather than shell scripts with implicit ordering, you write unit files that explicitly state dependencies. Rather than ad-hoc logging, every process writes to the journal with metadata. Rather than hoping services stay running, you declare <code>Restart=on-failure</code> and systemd handles it.</p>
+<pre><code>systemd (PID 1)
+    │
+    ├── reads all unit files from /usr/lib/systemd/system/ and /etc/systemd/system/
+    │
+    ├── builds dependency graph (Wants/Requires + After/Before)
+    │
+    ├── activates sockets early (socket activation)
+    │
+    ├── walks graph in parallel toward default.target
+    │   ├── sysinit.target   → mounts, udev, journal, crypto
+    │   ├── basic.target     → sockets, timers, paths
+    │   ├── multi-user.target → all system services
+    │   └── graphical.target → display manager
+    │
+    ├── places each service in its own cgroup
+    │
+    ├── collects all stdout/stderr into journald
+    │
+    └── monitors services, restarts on failure
+</code></pre>
+<p>The next chapter goes one level deeper: what is a process, what does the kernel actually store for each one, and how does <code>fork()</code> work under the hood?</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-3-processes--fork-exec-and-the-process-table"><a class="header" href="#linux-deep-dive-3-processes--fork-exec-and-the-process-table">Linux Deep Dive #3: Processes — fork, exec, and the Process Table</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache"><a class="header" href="#linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache">Linux Deep Dive #4: Memory Management — Virtual Memory and the Page Cache</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs"><a class="header" href="#linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs">Linux Deep Dive #5: The Scheduler — How the Kernel Decides What Runs</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-6-the-vfs-layer--how-linux-abstracts-filesystems"><a class="header" href="#linux-deep-dive-6-the-vfs-layer--how-linux-abstracts-filesystems">Linux Deep Dive #6: The VFS Layer — How Linux Abstracts Filesystems</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-7-btrfs--snapshots-subvolumes-and-cow"><a class="header" href="#linux-deep-dive-7-btrfs--snapshots-subvolumes-and-cow">Linux Deep Dive #7: Btrfs — Snapshots, Subvolumes, and CoW</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-8-block-io--from-read-to-the-disk"><a class="header" href="#linux-deep-dive-8-block-io--from-read-to-the-disk">Linux Deep Dive #8: Block I/O — From read() to the Disk</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-9-composefs--composing-read-only-filesystems"><a class="header" href="#linux-deep-dive-9-composefs--composing-read-only-filesystems">Linux Deep Dive #9: composefs — Composing Read-Only Filesystems</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-10-ostree--immutable-trees-and-atomic-updates"><a class="header" href="#linux-deep-dive-10-ostree--immutable-trees-and-atomic-updates">Linux Deep Dive #10: ostree — Immutable Trees and Atomic Updates</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-11-rpm-ostree--layering-packages-on-an-immutable-base"><a class="header" href="#linux-deep-dive-11-rpm-ostree--layering-packages-on-an-immutable-base">Linux Deep Dive #11: rpm-ostree — Layering Packages on an Immutable Base</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-12-bootc--the-os-as-a-container-image"><a class="header" href="#linux-deep-dive-12-bootc--the-os-as-a-container-image">Linux Deep Dive #12: bootc — The OS as a Container Image</a></h1>
+<p><em>Coming soon.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-13-networkmanager--from-interface-detection-to-ip-address"><a class="header" href="#linux-deep-dive-13-networkmanager--from-interface-detection-to-ip-address">Linux Deep Dive #13: NetworkManager — From Interface Detection to IP Address</a></h1>
+<p><em>Coming soon.</em></p>
 
                     </main>
 

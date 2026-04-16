@@ -62,7 +62,12 @@ Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
                  + 15.109s (initrd) + 12.194s (userspace) = 37.501s
 ```
 
-Systemd measures and records every phase. The kernel literally timestamps when it hands off to initramfs, and systemd records when it took over. We'll use this throughout.
+How does `systemd-analyze` know these numbers? Each phase boundary is a measured handoff, not an estimate:
+
+- **Kernel phase**: When the kernel finishes its initialization and mounts the initramfs as the root filesystem, it records a timestamp to the monotonic clock. This marks the end of the "kernel" phase and the start of the "initrd" phase.
+- **initrd and userspace phases**: When systemd starts running (first inside initramfs, then as the real PID 1 after `pivot_root`), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.
+
+We'll use this data throughout.
 
 ---
 
@@ -126,9 +131,13 @@ ls /boot/efi/EFI/fedora/
 # shim.efi  shimx64.efi  grubx64.efi  grub.cfg  ...
 ```
 
+**`/boot` vs `/boot/efi` — a common point of confusion.** These are two different things. `/boot` is a regular directory (or sometimes its own partition) on your root filesystem — it holds kernels, initramfs images, and GRUB config files, typically on ext4 or Btrfs. `/boot/efi` is where the ESP is *mounted* — it's a separate FAT32 partition (FAT32 is required by the UEFI spec) that contains the `.efi` bootloader binaries. So when you see `/boot/efi/EFI/fedora/shim.efi`, you're looking at a file on the FAT32 ESP partition, not on your root filesystem.
+
+Most distros (Fedora, Debian, Ubuntu) mount the ESP at `/boot/efi`. Arch Linux often mounts the ESP directly at `/boot`, which works fine for single-boot setups. If you're dual-booting or sharing a machine with a Debian-based distro, use `/boot/efi` as the ESP mount point to avoid conflicts — different distros have different expectations about what lives in `/boot`.
+
 ### What UEFI hands to GRUB
 
-UEFI doesn't just load GRUB and forget it. It passes a **handoff structure** containing:
+UEFI doesn't just load GRUB and forget it. UEFI hands control to GRUB by locating and executing the `grubx64.efi` application (or `shimx64.efi` for Secure Boot) stored on the FAT32-formatted ESP. It passes a **handoff structure** containing:
 - The memory map (what physical RAM exists and which regions are usable)
 - A pointer to the UEFI runtime services (which the kernel uses later for things like `efivarfs`)
 - ACPI tables
@@ -169,17 +178,33 @@ BOOT_IMAGE=(hd0,gpt2)/vmlinuz-6.19.11-200.fc43.x86_64
 
 There's a lot of information here. Let's decode it:
 
-| Parameter | Meaning |
-|-----------|---------|
-| `BOOT_IMAGE=(hd0,gpt2)/vmlinuz-...` | The kernel file GRUB loaded, from partition 2 of disk 0 |
-| `root=UUID=37e2f5e1-...` | The root filesystem to mount after boot |
-| `ro` | Mount root read-only initially (fsck can run; remounted rw later) |
-| `rootflags=subvol=root` | Btrfs-specific: mount the `root` subvolume |
-| `rd.luks.uuid=luks-5ea459ba-...` | Tell initramfs to unlock a LUKS-encrypted device |
-| `rhgb` | Red Hat Graphical Boot (Plymouth splash screen) |
-| `quiet` | Suppress most kernel messages on console |
+| Parameter                           | Meaning                                                           |
+| ----------------------------------- | ----------------------------------------------------------------- |
+| `BOOT_IMAGE=(hd0,gpt2)/vmlinuz-...` | The kernel file GRUB loaded, from partition 2 of disk 0           |
+| `root=UUID=37e2f5e1-...`            | The root filesystem to mount after boot                           |
+| `ro`                                | Mount root read-only initially (fsck can run; remounted rw later) |
+| `rootflags=subvol=root`             | Btrfs-specific: mount the `root` subvolume                        |
+| `rd.luks.uuid=luks-5ea459ba-...`    | Tell initramfs to unlock a LUKS-encrypted device                  |
+| `rhgb`                              | Red Hat Graphical Boot (Plymouth splash screen)                   |
+| `quiet`                             | Suppress most kernel messages on console                          |
 
 This one command line tells the whole story of this machine's storage setup: there's a Btrfs filesystem inside a LUKS-encrypted container, and the bootable root is a subvolume within it.
+
+### Who actually reads the command line?
+
+The kernel command line is a single string, but it's consumed by multiple components. You might wonder: how does `rd.luks.uuid` end up in the initramfs while `quiet` goes to the kernel? The answer is a filtering hierarchy:
+
+1. **Known kernel parameters**: If the kernel recognizes the string (`root=`, `ro`, `quiet`, etc.), it uses it to configure itself during `start_kernel()`.
+
+2. **Module parameters**: If the string contains a dot (e.g., `nvidia.modeset=1`), the kernel treats the part before the dot as a module name and passes the value to that module when it loads.
+
+3. **initramfs directives**: Parameters prefixed with `rd.*` are conventions established by dracut. The kernel doesn't interpret them — dracut's scripts inside the initramfs read `/proc/cmdline` and act on the ones they recognize (like `rd.luks.uuid`).
+
+4. **systemd parameters**: systemd also reads `/proc/cmdline` when it starts. Parameters like `systemd.unit=multi-user.target` or `systemd.log_level=debug` let you configure PID 1 from the bootloader.
+
+5. **The unknowns**: Historically, any parameter not recognized by the kernel and not containing a dot was passed to PID 1 as an environment variable. Modern systemd is stricter about this for security reasons — it won't turn arbitrary strings into `$VARIABLES`. If you need to set an environment variable via the command line, use the explicit `systemd.setenv=VAR=VALUE` syntax.
+
+The whole thing works because `/proc/cmdline` is readable by anyone — every component just picks out the parameters it cares about and ignores the rest.
 
 ### What GRUB loads
 
@@ -197,6 +222,19 @@ $ ls -lh /boot/initramfs-6.19.11-200.fc43.x86_64.img
 ```
 
 Once both are in RAM, GRUB jumps to the kernel's entry point. GRUB is done.
+
+### What about systemd-boot?
+
+GRUB2 isn't the only bootloader in the Linux world. **systemd-boot** (formerly known as gummiboot) is a simpler alternative that's gaining adoption — Arch Linux, some Ubuntu configurations, and Fedora all support it.
+
+The key differences from GRUB2:
+
+- **No scripting language or config generator.** GRUB2 has its own shell, scripting, and `grub2-mkconfig`. systemd-boot has none of that — it reads simple drop-in files directly.
+- **Uses the Boot Loader Specification (BLS).** Each kernel gets a small `.conf` file in the ESP (typically under `loader/entries/`) that lists the kernel path, initramfs path, and command line options. Adding a kernel means dropping a file; removing one means deleting it.
+- **Lives entirely on the ESP.** GRUB2 reads from both the ESP and `/boot` (a separate partition). systemd-boot reads everything from the ESP's FAT32 filesystem.
+- **No theming or interactive shell.** It shows a plain menu and boots. That's it.
+
+This machine uses GRUB2, so that's what we trace in this post. But if you run `bootctl status` and see output instead of an error, your system is using systemd-boot — the handoff to the kernel works the same way, just with less machinery in between.
 
 ---
 

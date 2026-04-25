@@ -38,7 +38,7 @@ Power on
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  PHASE 4 — initramfs                           ~15s         │
-│  Unlock LUKS → find root filesystem → pivot_root            │
+│  Unlock LUKS → find root filesystem → switch_root           │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -65,7 +65,7 @@ Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
 How does `systemd-analyze` know these numbers? Each phase boundary is a measured handoff, not an estimate:
 
 - **Kernel phase**: When the kernel finishes its initialization and mounts the initramfs as the root filesystem, it records a timestamp to the monotonic clock. This marks the end of the "kernel" phase and the start of the "initrd" phase.
-- **initrd and userspace phases**: When systemd starts running (first inside initramfs, then as the real PID 1 after `pivot_root`), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.
+- **initrd and userspace phases**: When systemd starts running (first inside initramfs, then as the real PID 1 after `switch_root`), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.
 
 We'll use this data throughout.
 
@@ -363,6 +363,12 @@ On this system the initramfs is 70MB — because it contains:
 
 **dracut** is Fedora's tool for building initramfs images. It takes a modular approach: you declare which "dracut modules" you need, and it assembles the minimal environment for your specific machine.
 
+dracut runs at three points in a system's life:
+
+1. **During OS installation** — the installer calls dracut at the end to build an initramfs tailored to the hardware it just installed onto.
+2. **On every kernel update** — when `dnf` installs a new kernel, a post-install hook automatically triggers dracut to build a matching initramfs. Kernel modules are version-specific, so the old initramfs won't work with the new kernel.
+3. **Manually, when you change low-level storage configuration** — moving to a different machine, enabling LUKS, or installing early-boot drivers (like Nvidia) requires a fresh initramfs.
+
 ```bash
 # Rebuild initramfs for the current kernel (run as root):
 dracut --force
@@ -370,6 +376,15 @@ dracut --force
 # See what dracut modules were included:
 lsinitrd /boot/initramfs-$(uname -r).img | grep 'dracut module'
 ```
+
+### How the kernel enters initramfs
+
+After mounting the initramfs as its root filesystem, the kernel executes a single file: **`/init`**. Whatever that file is becomes PID 1.
+
+- In older systems, `/init` was a shell script that sequentially unlocked storage, mounted the real root, and called `pivot_root`.
+- In modern dracut-built initramfs images, `/init` is a symlink to a **stripped-down systemd**. This early systemd has one job: get to `/sysroot`. It doesn't start your network, desktop, or user services — just the storage and crypto units needed to mount the real root.
+
+Using systemd here rather than a script enables parallelism: it can simultaneously wait for a USB device to initialize, prompt for a LUKS passphrase, and assemble an LVM/RAID array.
 
 ### LUKS unlocking in the initramfs
 
@@ -388,11 +403,15 @@ rd.luks.uuid=luks-5ea459ba-b7ec-439a-a3cf-7d25ff3b2889
 
 This is why initramfs took **15 seconds** on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key). On an unencrypted system, initramfs skips the LUKS step entirely, and this phase drops from ~15s to ~2s. The initramfs image is also much smaller since `cryptsetup` and its dependencies aren't needed.
 
-### pivot_root: switching to the real root
+### switch_root: handing off to the real filesystem
 
-Once the real root filesystem is mounted (say, at `/sysroot` within the initramfs), the kernel performs a **pivot_root** operation: it atomically makes `/sysroot` the new root (`/`), and the old initramfs root becomes unreachable. After pivot_root, the kernel executes the real `/usr/lib/systemd/systemd` as PID 1.
+Once the real root filesystem is mounted at `/sysroot`, the initramfs systemd performs **`switch_root`** — a three-step operation:
 
-The initramfs is now gone from the filesystem tree. (It remains in RAM but its memory is reclaimed.)
+1. **Pivot**: `/sysroot` becomes the new `/`. The old initramfs root is displaced.
+2. **Free**: The initramfs is deleted from RAM, reclaiming its memory.
+3. **Exec**: The real `/usr/lib/systemd/systemd` on disk is exec'd, taking over as PID 1.
+
+The key distinction from the lower-level `pivot_root` syscall: `switch_root` actively frees the initramfs memory and is performed by systemd inside the initramfs — the kernel doesn't do this on its own. Notably, `switch_root` doesn't even call the `pivot_root` syscall under the hood — it uses `mount --move` (`MS_MOVE`) instead, which relocates the mount point without the namespace gymnastics that `pivot_root` requires.
 
 ---
 
@@ -631,7 +650,7 @@ Power on
        Prompts for passphrase / unseals TPM key
        cryptsetup luksOpen → creates /dev/mapper/luks-...
        Mounts Btrfs filesystem, subvolume "root", at /sysroot
-       pivot_root: /sysroot becomes new /
+       switch_root: /sysroot becomes new /, initramfs freed from RAM
        Exec real /usr/lib/systemd/systemd
     │
     ▼  systemd (PID 1) reads unit files

@@ -180,7 +180,507 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache"><a class="header" href="#linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache">Linux Deep Dive #4: Memory Management — Virtual Memory and the Page Cache</a></h1>
-<p><em>Coming soon.</em></p>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>Run <code>free -h</code> on any Linux system that's been running for a while:</p>
+<pre><code>$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        22Gi       200Mi       500Mi       7.8Gi        7.3Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>Most people see the <code>free</code> column — 200 MB — and worry. Only 200 MB of RAM left? But the system is perfectly healthy. <code>available</code> is 7.3 GiB. Something is using 7.8 GiB under <code>buff/cache</code>, and it can be reclaimed on demand.</p>
+<p>This is the kernel doing its job. Idle RAM is wasted RAM. The kernel fills unused memory with file data it might need again, making disk reads fast. When a process needs memory, the kernel reclaims the cache. The <code>free</code> column tells you almost nothing useful. <code>available</code> is the number that matters.</p>
+<p>This chapter explains why — by tracing the full memory architecture from virtual addresses through page tables to physical frames, through the page cache and back. We'll cover how the kernel allocates physical memory, what really happens on a page fault, how the page cache works, and how the kernel reclaims memory under pressure.</p>
+<hr />
+<h2 id="memory-at-a-glance"><a class="header" href="#memory-at-a-glance">Memory at a Glance</a></h2>
+<pre><code>User process (virtual address space)
+    │
+    │  Virtual address → MMU → page table walk
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  4-Level Page Tables                                  │
+│  PGD → PUD → PMD → PTE → physical frame              │
+│  TLB caches recent translations                      │
+└──────────────────────────────────────────────────────┘
+    │
+    │  physical frame number
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  Physical Memory                                      │
+│  ┌────────────────────┐  ┌──────────────────────┐   │
+│  │  Anonymous pages   │  │  File-backed pages   │   │
+│  │  heap, stack, CoW  │  │  (the page cache)    │   │
+│  │  must swap to evict│  │  can drop for free   │   │
+│  └────────────────────┘  └──────────────────────┘   │
+│                                                       │
+│  Buddy allocator manages frames (4KB to 4MB blocks)  │
+│  SLUB allocator carves pages into kernel objects     │
+└──────────────────────────────────────────────────────┘
+    │
+    │  when free memory drops below watermarks
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  Reclaim                                              │
+│  kswapd scans LRU lists                              │
+│  ├── file pages: drop (clean) or writeback + drop    │
+│  └── anon pages: write to swap, then free frame      │
+│                                                       │
+│  Last resort: OOM killer                             │
+└──────────────────────────────────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="virtual-addresses-and-page-tables"><a class="header" href="#virtual-addresses-and-page-tables">Virtual Addresses and Page Tables</a></h2>
+<p>Chapter 3 showed that every process has an <code>mm_struct</code> containing a set of VMAs — contiguous virtual address regions with permissions like <code>r-xp</code> or <code>rw-p</code>. But how does a virtual address in a VMA actually become a physical address the CPU can use?</p>
+<p>The answer is the page table.</p>
+<h3 id="the-4-level-page-table-on-x86-64"><a class="header" href="#the-4-level-page-table-on-x86-64">The 4-Level Page Table on x86-64</a></h3>
+<p>On a 64-bit x86 system, virtual addresses are 48 bits wide. The CPU uses a 4-level page table structure to translate them:</p>
+<pre><code>Virtual address (48-bit):
+  ┌───────┬───────┬───────┬───────┬──────────────┐
+  │  PGD  │  PUD  │  PMD  │  PTE  │ Page offset  │
+  │ 9 bit │ 9 bit │ 9 bit │ 9 bit │   12 bit     │
+  └───────┴───────┴───────┴───────┴──────────────┘
+
+PGD = Page Global Directory   (top-level)
+PUD = Page Upper Directory
+PMD = Page Middle Directory
+PTE = Page Table Entry        (leaf: physical frame number + flags)
+</code></pre>
+<p>The translation works like a 4-level lookup:</p>
+<pre><code>CR3 register → PGD table
+    │  index with bits 47–39
+    ▼
+PGD entry → PUD table
+    │  index with bits 38–30
+    ▼
+PUD entry → PMD table
+    │  index with bits 29–21
+    ▼
+PMD entry → PTE table
+    │  index with bits 20–12
+    ▼
+PTE entry: physical frame number + R/W/X/U flags
+    │  + page offset (bits 11–0)
+    ▼
+Physical address
+</code></pre>
+<p>Each level is a 4KB page holding 512 8-byte entries (9 bits of index → 2^9 = 512). The final 12 bits of the virtual address index into the 4KB page. This gives 48-bit coverage: 9+9+9+9+12 = 48.</p>
+<p>The flags in each PTE are what drive many kernel mechanisms:</p>
+<div class="table-wrapper"><table><thead><tr><th>PTE flag</th><th>Effect</th></tr></thead><tbody>
+<tr><td>Present</td><td>Page is in RAM; if clear, triggers a page fault</td></tr>
+<tr><td>Writable</td><td>Write permission; if clear on a mapped page, triggers CoW fault</td></tr>
+<tr><td>User</td><td>Accessible from user space; kernel-only pages have this clear</td></tr>
+<tr><td>Accessed</td><td>CPU sets this when the page is read (used by reclaim)</td></tr>
+<tr><td>Dirty</td><td>CPU sets this on write (used to detect pages needing writeback)</td></tr>
+<tr><td>NX (No-Execute)</td><td>Prevents execution of data pages</td></tr>
+</tbody></table>
+</div>
+<p>You can see the page table walk in action through <code>/proc/[pid]/pagemap</code>, though that requires root. The more accessible view is <code>/proc/[pid]/maps</code>, which shows the VMAs:</p>
+<pre><code class="language-bash">$ cat /proc/$$/maps | head -8
+5592b7c38000-5592b7c3e000 r--p 00000000 fd:01 530753  /usr/bin/bash
+5592b7c3e000-5592b7c7e000 r-xp 00006000 fd:01 530753  /usr/bin/bash
+5592b7c7e000-5592b7cad000 r--p 00046000 fd:01 530753  /usr/bin/bash
+5592b7cae000-5592b7cb2000 rw-p 00075000 fd:01 530753  /usr/bin/bash
+5592b9040000-5592b90ae000 rw-p 00000000 00:00 0       [heap]
+7f2345a00000-7f2345c00000 r--p 00000000 fd:01 398912  /usr/lib/locale/locale-archive
+...
+7ffe8e3b0000-7ffe8e3d2000 rw-p 00000000 00:00 0       [stack]
+7ffe8e3f8000-7ffe8e3fc000 r--p 00000000 00:00 0       [vvar]
+</code></pre>
+<p>Each row is a VMA. The permissions <code>r-xp</code>, <code>rw-p</code>, <code>r--p</code> map directly to PTE flags. The page table for this process contains entries for each page within each VMA — but only for pages that have actually been touched (page tables are themselves demand-paged).</p>
+<h3 id="the-tlb-caching-page-table-lookups"><a class="header" href="#the-tlb-caching-page-table-lookups">The TLB: Caching Page Table Lookups</a></h3>
+<p>Four memory accesses to translate one address would be crippling. The CPU keeps a <strong>Translation Lookaside Buffer (TLB)</strong> — a small hardware cache of recent virtual→physical translations. A TLB hit returns the physical address in a single cycle. A miss triggers the full 4-level walk.</p>
+<p>TLB misses are part of why context switches have measurable cost: switching processes means switching page tables (loading a new value into <code>CR3</code>), which flushes the TLB. The next few hundred memory accesses in the new process are all TLB misses until the cache warms up.</p>
+<p>The kernel minimizes TLB pressure through <strong>huge pages</strong>: instead of 4KB pages (needing many TLB entries), the kernel can use 2MB pages (PMD-level mappings), covering 512× more memory with a single TLB entry. On this system, transparent huge pages (THP) are in <code>madvise</code> mode — the kernel uses 2MB pages for anonymous memory when the application explicitly requests them:</p>
+<pre><code class="language-bash">$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+</code></pre>
+<hr />
+<h2 id="physical-memory--zones-the-buddy-allocator-and-slab"><a class="header" href="#physical-memory--zones-the-buddy-allocator-and-slab">Physical Memory — Zones, the Buddy Allocator, and Slab</a></h2>
+<h3 id="memory-zones"><a class="header" href="#memory-zones">Memory Zones</a></h3>
+<p>Not all physical RAM is equivalent. Legacy ISA devices could only DMA to the first 16 MB. Older PCI devices can only address below 4 GB. The kernel divides physical memory into <strong>zones</strong> to track these constraints:</p>
+<pre><code class="language-bash">$ cat /proc/buddyinfo
+Node 0, zone      DMA      0      0      0      0      0      0      0      0      1      1      2
+Node 0, zone    DMA32     17     13     13     12      9      9     14     12      9      9    768
+Node 0, zone   Normal  65656  39923  16923   8715   2995    987    367    127     53     27   1876
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Zone</th><th>Physical range</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>DMA</td><td>0–16 MB</td><td>ISA/legacy DMA devices</td></tr>
+<tr><td>DMA32</td><td>0–4 GB</td><td>32-bit PCI devices</td></tr>
+<tr><td>Normal</td><td>&gt; 4 GB</td><td>All other allocations</td></tr>
+</tbody></table>
+</div>
+<p>On this 30 GB machine, the <code>Normal</code> zone holds almost all RAM.</p>
+<h3 id="the-buddy-allocator"><a class="header" href="#the-buddy-allocator">The Buddy Allocator</a></h3>
+<p>The kernel's fundamental physical memory allocator is the <strong>buddy allocator</strong>. It maintains 11 free lists, indexed by order 0 through 10, where order N holds blocks of 2^N contiguous pages:</p>
+<pre><code>Order 0:  1 page   = 4KB
+Order 1:  2 pages  = 8KB
+Order 2:  4 pages  = 16KB
+...
+Order 10: 1024 pages = 4MB
+</code></pre>
+<p>The numbers in <code>buddyinfo</code> are the count of free blocks at each order. In the <code>Normal</code> zone above, there are 65,656 order-0 blocks (4KB each), 39,923 order-1 blocks (8KB each), and so on.</p>
+<p>When the kernel needs N pages:</p>
+<ol>
+<li>Find the smallest order ≥ N with a free block</li>
+<li>If that order is larger than needed, <strong>split</strong> the block: one half goes to the next lower order's free list, the other half is used</li>
+<li>When pages are freed, the kernel checks if the adjacent "buddy" block is also free; if so, they <strong>merge</strong> back to the higher order</li>
+</ol>
+<p>Splitting and merging keep the allocator efficient and minimize fragmentation. You can watch allocation pressure by checking how many high-order blocks remain — if order-10 is empty and order-0 is full, the system is fragmented and can't satisfy large contiguous allocations.</p>
+<pre><code class="language-bash"># Watch buddy allocator state live
+watch -d cat /proc/buddyinfo
+</code></pre>
+<h3 id="the-slub-allocator"><a class="header" href="#the-slub-allocator">The SLUB Allocator</a></h3>
+<p>The buddy allocator deals in full pages. But the kernel constantly allocates objects much smaller than 4KB: <code>task_struct</code> (~7KB but padded), <code>file</code> (~300 bytes), <code>dentry</code> (~200 bytes), <code>inode</code> (~600 bytes), socket buffers (~200 bytes each). Handing out a full 4KB page for each would waste enormous amounts of RAM.</p>
+<p>The <strong>SLUB allocator</strong> (Simplified Unqueued Layer) sits on top of the buddy allocator. It maintains per-CPU <strong>slabs</strong> — pages filled with pre-allocated objects of a single size. Allocating a small kernel object takes a free slot from a slab; freeing it returns the slot. No buddyallocator call needed.</p>
+<pre><code class="language-bash"># See the largest slab caches by memory usage
+$ sudo slabtop -o | head -15
+ Active / Total Objects (% used)    : 2344037 / 2429115 (96.5%)
+ Active / Total Slabs (% used)      : 82684 / 82684 (100.0%)
+ Active / Total Caches (% used)     : 193 / 244 (79.1%)
+ Active / Total Size (% used)       : 622408.38K / 655006.31K (95.0%)
+
+  OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME
+253056 253056 100%    0.19K   6016       42     24064K dentry
+198400 186988  94%    0.06K   3100       64      6200K kmalloc-64
+110916  95897  86%    1.06K   9243       12    147888K inode_cache
+ 37248  37248 100%    0.50K   1164       32     18624K kmalloc-512
+</code></pre>
+<p><code>dentry</code> (directory entry cache) and <code>inode_cache</code> are typically the largest slab consumers — the kernel caches filesystem metadata aggressively because lookups are frequent and disk access is slow.</p>
+<hr />
+<h2 id="page-faults"><a class="header" href="#page-faults">Page Faults</a></h2>
+<p>When the CPU walks the page table and something is wrong, it raises a <strong>page fault</strong> — a hardware exception that transfers control to the kernel's fault handler (<code>handle_mm_fault()</code> in <code>mm/memory.c</code>). There are several distinct kinds:</p>
+<div class="table-wrapper"><table><thead><tr><th>Fault type</th><th>Cause</th><th>Kernel action</th><th>Disk I/O?</th></tr></thead><tbody>
+<tr><td><strong>Minor</strong></td><td>Page in VMA but PTE not present (first access)</td><td>Allocate frame, fill PTE</td><td>No</td></tr>
+<tr><td><strong>Major</strong></td><td>Page was evicted to disk; PTE marked not-present</td><td>Read page from disk, fill PTE</td><td>Yes</td></tr>
+<tr><td><strong>CoW</strong></td><td>Write to a read-only shared page (after fork)</td><td>Copy page, update PTE to writable</td><td>No</td></tr>
+<tr><td><strong>Invalid</strong></td><td>Access outside any VMA</td><td>Deliver SIGSEGV</td><td>No</td></tr>
+</tbody></table>
+</div>
+<p>Minor faults are normal and constant — they happen every time a program accesses a new page of its heap or stack. The kernel allocates a physical frame, zeros it (to prevent information leaks), updates the PTE, and the program continues. No disk I/O, just a brief detour through the kernel.</p>
+<p>Major faults are a symptom of memory pressure. They mean the kernel previously evicted this page to disk to free RAM, and now the program needs it back. Major faults cause visible latency — the application stalls waiting for the disk read to complete.</p>
+<pre><code class="language-bash"># Page fault totals since boot
+$ grep -E '^pgfault|^pgmajfault' /proc/vmstat
+pgfault       39670010   # minor faults — normal, healthy
+pgmajfault        3007   # major faults — disk reads to recover evicted pages
+</code></pre>
+<p>39 million minor faults since boot is expected. 3007 major faults is low — this system hasn't been under enough memory pressure to evict much. On a memory-constrained system, <code>pgmajfault</code> climbs steadily and latency spikes whenever a major fault stalls a thread.</p>
+<p>The CoW fault is the mechanism from Chapter 3: after <code>fork()</code>, parent and child share physical pages marked read-only. The first write from either side triggers a fault, the kernel copies the page, and both now have their own writable copy.</p>
+<p>You can measure per-process fault rates in real time:</p>
+<pre><code class="language-bash"># Fault rates for a running process
+$ cat /proc/1/status | grep -i fault
+voluntary_ctxt_switches: 31248
+nonvoluntary_ctxt_switches: 1156
+
+# For cumulative fault count, smaps_rollup is faster than summing smaps:
+$ sudo cat /proc/1/smaps_rollup | grep -E 'Rss|Pss'
+Rss:               21432 kB
+Pss:               13891 kB
+</code></pre>
+<hr />
+<h2 id="the-page-cache"><a class="header" href="#the-page-cache">The Page Cache</a></h2>
+<p>This is the mechanism behind the <code>buff/cache</code> column in <code>free</code>. It's also the single most important thing to understand about Linux memory management.</p>
+<h3 id="the-basic-idea"><a class="header" href="#the-basic-idea">The Basic Idea</a></h3>
+<p>When you <code>read()</code> from a file, the kernel doesn't transfer bytes directly from disk to your process. It maintains a <strong>page cache</strong> — a pool of physical pages indexed by <code>(filesystem inode, page offset)</code>. The read path is:</p>
+<pre><code>read() syscall
+    │
+    ├── Is (inode, offset) already in the page cache?
+    │   ├── Yes: copy from cache to user buffer → done (no disk I/O)
+    │   └── No:  read from disk into a new cache page,
+    │             then copy to user buffer
+    │
+    └── Cache page stays in RAM after the read
+</code></pre>
+<p>The page cache entry persists after your <code>read()</code> returns. The <em>next</em> <code>read()</code> of the same region — whether by you, another process, or another program — finds it in cache and pays no disk cost.</p>
+<p>This is why a fresh <code>make</code> that compiles 10,000 source files goes faster on the second run: all those file reads hit the cache. The first run was I/O-bound; the second is CPU-bound.</p>
+<h3 id="file-backed-vs-anonymous-memory"><a class="header" href="#file-backed-vs-anonymous-memory">File-Backed vs Anonymous Memory</a></h3>
+<p>Physical memory pages fall into two categories:</p>
+<pre><code>Physical pages
+    │
+    ├── File-backed (page cache)
+    │   ├── Clean: identical to disk → kernel can drop for free
+    │   └── Dirty: modified, not yet written back
+    │           → kernel must flush to disk before dropping
+    │
+    └── Anonymous (no file)
+        ├── Heap, stack, CoW copies, anonymous mmap
+        └── To free: must write to swap device first
+                      (or kill the process)
+</code></pre>
+<p>File-backed pages are cheap to evict — the kernel just drops the page and re-reads it from disk if needed again. Anonymous pages are expensive: they have no file backing, so eviction requires writing to swap and reading back later.</p>
+<p>This distinction drives the entire reclaim strategy.</p>
+<h3 id="mmap-and-the-page-cache"><a class="header" href="#mmap-and-the-page-cache">mmap() and the Page Cache</a></h3>
+<p><code>mmap()</code> is the page cache seen from the process side. When your program opens a file and calls:</p>
+<pre><code class="language-c">void *ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+</code></pre>
+<p>The kernel creates a VMA that represents a window into the file's pages in the page cache. No data is loaded yet. When you dereference <code>ptr</code>, a minor page fault fires; the kernel checks the page cache (reading from disk if necessary), and installs a PTE pointing to that cache page. <strong>The process's PTE and the page cache entry point to the same physical frame.</strong></p>
+<p>This has an important consequence: every process running the same program shares its text segment.</p>
+<pre><code class="language-bash"># How many processes share bash's text pages?
+$ cat /proc/$(pgrep -n bash)/smaps | grep -A 10 'bash$' | head -12
+5592b7c3e000-5592b7c7e000 r-xp 00006000 fd:01 530753  /usr/bin/bash
+Size:                256 kB
+KernelPageSize:        4 kB
+Rss:                 252 kB
+Pss:                  14 kB    ← proportional share — 252KB / ~18 processes
+Shared_Clean:        252 kB    ← all of it is shared
+Private_Clean:         0 kB
+</code></pre>
+<p><code>Rss</code> (Resident Set Size) is the total physical memory mapped. <code>Pss</code> (Proportional Set Size) divides shared pages by the number of processes sharing them. The <code>r-xp</code> text segment shows <code>Shared_Clean: 252 kB</code> and <code>Pss: 14 kB</code> — 18 bash processes share the same physical pages. One copy in RAM, many processes using it.</p>
+<h3 id="reading-the-page-cache-statistics"><a class="header" href="#reading-the-page-cache-statistics">Reading the Page Cache Statistics</a></h3>
+<pre><code class="language-bash">$ grep -E '^(Cached|Buffers|Mapped|Dirty|Writeback)' /proc/meminfo
+Buffers:            4208 kB
+Cached:          6564188 kB
+Mapped:          1189268 kB
+Dirty:              1336 kB
+Writeback:             0 kB
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Cached</code></td><td>Total page cache size</td></tr>
+<tr><td><code>Buffers</code></td><td>Block device metadata cache (separate from file data cache)</td></tr>
+<tr><td><code>Mapped</code></td><td>Page cache pages currently mapped into at least one process's address space</td></tr>
+<tr><td><code>Dirty</code></td><td>Modified pages not yet written to disk</td></tr>
+<tr><td><code>Writeback</code></td><td>Pages currently being written to disk</td></tr>
+</tbody></table>
+</div>
+<p>On this machine, <code>Cached</code> is 6.4 GB — 6.4 GB of file data sitting in RAM, ready for instant re-use. <code>Dirty</code> is only 1.3 MB, meaning the kernel's writeback threads are keeping up with writes. <code>Writeback</code> is 0, so no I/O is in flight right now.</p>
+<hr />
+<h2 id="reclaim--how-the-kernel-manages-memory-pressure"><a class="header" href="#reclaim--how-the-kernel-manages-memory-pressure">Reclaim — How the Kernel Manages Memory Pressure</a></h2>
+<h3 id="lru-lists"><a class="header" href="#lru-lists">LRU Lists</a></h3>
+<p>The kernel tracks which pages are worth keeping with four LRU (Least Recently Used) lists:</p>
+<pre><code>LRU lists
+    ├── active_file    — recently used file-backed pages
+    ├── inactive_file  — older file-backed pages (reclaim candidates)
+    ├── active_anon    — recently used anonymous pages
+    └── inactive_anon  — older anonymous pages (swap candidates)
+</code></pre>
+<p>Pages move between these lists based on access patterns. The hardware <strong>Accessed</strong> bit in PTEs tells the kernel when a page was last used. Pages migrate from active to inactive when they haven't been accessed for a while; from inactive, they become reclaim candidates.</p>
+<pre><code class="language-bash">$ grep -E '^(Active|Inactive)' /proc/meminfo
+Active:          7844660 kB
+Inactive:        4958656 kB
+Active(anon):    4685204 kB
+Inactive(anon):        0 kB
+Active(file):    3159456 kB
+Inactive(file):  4958656 kB
+</code></pre>
+<p>On this system: 4.7 GB of anonymous memory is active (process heaps/stacks in use), 3.2 GB of file cache is active (recently read files). The 4.9 GB of inactive file cache is the first thing kswapd will drop if memory gets tight.</p>
+<h3 id="kswapd-and-watermarks"><a class="header" href="#kswapd-and-watermarks">kswapd and Watermarks</a></h3>
+<p><strong>kswapd</strong> is a kernel thread that maintains free memory within a healthy range. The kernel defines three watermarks for each zone:</p>
+<pre><code>Zone free pages
+    │
+    ├── High watermark — kswapd stops here (plenty of free memory)
+    │
+    ├── Low watermark  — kswapd wakes up and starts reclaiming
+    │
+    └── Min watermark  — direct reclaim kicks in; allocations stall
+                         until kswapd frees enough pages
+</code></pre>
+<p>When free memory drops below the low watermark, kswapd wakes and scans the inactive lists:</p>
+<ol>
+<li><strong>Inactive file pages</strong> (clean): drop immediately — they're exact copies of disk data</li>
+<li><strong>Inactive file pages</strong> (dirty): schedule writeback, then drop after write completes</li>
+<li><strong>Inactive anon pages</strong>: write to swap device, then free the frame</li>
+</ol>
+<pre><code class="language-bash"># Is kswapd doing any work?
+$ grep -E 'pgsteal_kswapd|pgscan_kswapd|kswapd_low_wmark' /proc/vmstat
+pgsteal_kswapd             0    # pages reclaimed by kswapd (0 = no pressure)
+pgscan_kswapd              0    # pages scanned during reclaim
+kswapd_low_wmark_hit_quickly   0
+</code></pre>
+<p>All zeros: this system is not under memory pressure. kswapd is idle. On a memory-constrained system, <code>pgsteal_kswapd</code> climbs continuously.</p>
+<h3 id="swappiness"><a class="header" href="#swappiness">Swappiness</a></h3>
+<p>The <code>vm.swappiness</code> sysctl (0–200, default 60) controls the balance between evicting file cache and swapping anonymous pages. It's a weight in the reclaim cost calculation — higher values make the kernel more willing to swap anonymous pages alongside evicting file cache.</p>
+<pre><code class="language-bash">$ cat /proc/sys/vm/swappiness
+60
+</code></pre>
+<p>Contrary to common belief, swappiness is not a memory-use threshold. <code>swappiness=60</code> does not mean "start swapping at 60% memory use." It means: when choosing between evicting a file page and swapping an anonymous page, weight the decision so that both are considered in roughly a 60:100 ratio.</p>
+<p>Setting <code>swappiness=1</code> makes the kernel almost never swap — it will exhaust file cache before touching anonymous memory. Setting it to <code>200</code> makes the kernel aggressively swap, preferring to keep file cache hot. Neither extreme is universally right.</p>
+<pre><code class="language-bash"># Check swap usage
+$ grep -E '^(SwapTotal|SwapFree|SwapCached|Pswpin|Pswpout)' /proc/meminfo
+SwapTotal:       8388604 kB
+SwapFree:        8388604 kB
+SwapCached:            0 kB
+
+# Swap activity since boot
+$ grep -E '^pswp' /proc/vmstat
+pswpin    0     # pages swapped in (major faults from swap)
+pswpout   0     # pages swapped out
+</code></pre>
+<p>Zero swap activity on this machine — there's enough RAM that kswapd hasn't needed to swap anything out.</p>
+<hr />
+<h2 id="the-oom-killer"><a class="header" href="#the-oom-killer">The OOM Killer</a></h2>
+<p>When free memory hits zero, all reclaim options are exhausted, and a memory allocation is still failing, the kernel invokes the <strong>OOM killer</strong> (Out Of Memory killer) as a last resort.</p>
+<p>The OOM killer selects a process to terminate based on <code>oom_score</code> — a value from 0 to 1000 calculated from:</p>
+<ul>
+<li>RSS (how much RAM the process is actually using)</li>
+<li>Runtime (longer-running processes are slightly protected)</li>
+<li>Nice value (low-priority processes score higher)</li>
+<li>Whether the process is privileged (root processes score slightly lower)</li>
+</ul>
+<p>The process with the highest score gets killed with SIGKILL.</p>
+<pre><code class="language-bash"># OOM score for each running process
+$ cat /proc/1/oom_score          # systemd — should be 0 (protected)
+0
+
+$ cat /proc/$$/oom_score         # your shell
+5
+
+# Processes can adjust their score (-1000 to +1000)
+$ cat /proc/$$/oom_score_adj
+0
+</code></pre>
+<p>Setting <code>oom_score_adj</code> to <code>-1000</code> makes a process immune to OOM killing. Systemd sets itself to -1000 for exactly this reason. Critical system daemons often do the same. Setting it to <code>+1000</code> means "kill me first in an OOM."</p>
+<pre><code class="language-bash"># Which process would the OOM killer target right now?
+$ ps -eo pid,oom_score,rss,comm --sort=-oom_score | head -10
+    PID OOM_SCORE    RSS COMMAND
+   2847       182 2345200 firefox
+   3012        89  854320 slack
+   3201        45  412800 gnome-shell
+</code></pre>
+<p>The OOM killer fires rarely on a well-sized system. If it fires often, the right fix is more RAM, fixing a memory leak, or adding limits with memory cgroups — not tuning OOM parameters.</p>
+<hr />
+<h2 id="why-free-shows-almost-no-free-memory"><a class="header" href="#why-free-shows-almost-no-free-memory">Why <code>free</code> Shows Almost No "Free" Memory</a></h2>
+<p>Now we have all the pieces. Return to the output from a memory-loaded system:</p>
+<pre><code>$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        22Gi       200Mi       500Mi       7.8Gi        7.3Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>What does each column actually mean?</p>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>What it counts</th></tr></thead><tbody>
+<tr><td><code>total</code></td><td>Total physical RAM</td></tr>
+<tr><td><code>used</code></td><td>Process memory + kernel memory not reclaimable</td></tr>
+<tr><td><code>free</code></td><td>Completely idle frames — holding nothing</td></tr>
+<tr><td><code>shared</code></td><td>tmpfs and shared memory</td></tr>
+<tr><td><code>buff/cache</code></td><td>Page cache + buffer cache — <strong>reclaimable on demand</strong></td></tr>
+<tr><td><code>available</code></td><td>Estimated memory a new allocation could get ≈ free + reclaimable buff/cache</td></tr>
+</tbody></table>
+</div>
+<p>The <code>free</code> column being 200 MB does not mean the system is nearly out of memory. It means the kernel has filled almost all idle frames with page cache — which it should. Those 7.8 GB of <code>buff/cache</code> are serving file reads instantly.</p>
+<p>When a process needs more memory, the kernel reclaims from <code>buff/cache</code> first (by dropping clean file pages). The new allocation succeeds, and <code>buff/cache</code> shrinks. <code>available</code> — not <code>free</code> — is what tells you whether a large new allocation will succeed.</p>
+<p>The actual machine for this series has 30 GB of RAM and was not heavily loaded at the time this chapter was written:</p>
+<pre><code class="language-bash">$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        11Gi        12Gi       153Mi       6.6Gi        19Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>Here <code>free</code> is 12 GB — plenty. But the pattern is the same: <code>buff/cache</code> is 6.6 GB of page cache that the kernel built up from disk reads. It's not waste. It's usable memory being put to work.</p>
+<p>The rule: <strong>the system is healthy as long as <code>available</code> is above zero and <code>Swap:used</code> is not climbing rapidly.</strong></p>
+<pre><code class="language-bash"># One-liner to check memory health
+$ free -h &amp;&amp; grep -E '^(SwapFree|Dirty|Writeback)' /proc/meminfo
+</code></pre>
+<hr />
+<h2 id="try-it-yourself"><a class="header" href="#try-it-yourself">Try It Yourself</a></h2>
+<h3 id="1-the-big-picture"><a class="header" href="#1-the-big-picture">1. The big picture</a></h3>
+<pre><code class="language-bash">free -h
+cat /proc/meminfo
+</code></pre>
+<h3 id="2-where-is-memory-going-by-process"><a class="header" href="#2-where-is-memory-going-by-process">2. Where is memory going, by process?</a></h3>
+<pre><code class="language-bash"># Sort by RSS (resident, actual physical pages)
+ps -eo pid,rss,vsz,comm --sort=-rss | head -15
+
+# VSZ is virtual size (mapped but not necessarily in RAM)
+# RSS is what's actually resident in physical memory
+</code></pre>
+<h3 id="3-per-vma-detail-for-a-process"><a class="header" href="#3-per-vma-detail-for-a-process">3. Per-VMA detail for a process</a></h3>
+<pre><code class="language-bash"># smaps shows Rss, Pss (proportional), and sharing info per mapping
+cat /proc/$$/smaps | grep -E '^(Size|Rss|Pss|Shared_Clean|Private)' | head -30
+</code></pre>
+<h3 id="4-proportional-memory-use-across-the-system"><a class="header" href="#4-proportional-memory-use-across-the-system">4. Proportional memory use across the system</a></h3>
+<pre><code class="language-bash"># PSS (Proportional Set Size) divides shared pages fairly between sharers
+sudo cat /proc/*/smaps_rollup 2&gt;/dev/null | grep ^Pss | awk '{s+=$2} END {print s/1024 "MB total PSS"}'
+</code></pre>
+<h3 id="5-the-buddy-allocators-free-list"><a class="header" href="#5-the-buddy-allocators-free-list">5. The buddy allocator's free list</a></h3>
+<pre><code class="language-bash"># Higher-order blocks = less fragmentation = better large allocations
+cat /proc/buddyinfo
+</code></pre>
+<h3 id="6-slab-allocator-caches"><a class="header" href="#6-slab-allocator-caches">6. Slab allocator caches</a></h3>
+<pre><code class="language-bash">sudo slabtop -o | head -20
+# OBJ SIZE × SLABS × OBJ/SLAB = total memory used by each cache
+</code></pre>
+<h3 id="7-page-fault-counts-since-boot"><a class="header" href="#7-page-fault-counts-since-boot">7. Page fault counts since boot</a></h3>
+<pre><code class="language-bash">grep -E '^pgfault|^pgmajfault' /proc/vmstat
+# pgmajfault counts disk reads due to evicted pages — low is good
+</code></pre>
+<h3 id="8-is-kswapd-doing-any-work"><a class="header" href="#8-is-kswapd-doing-any-work">8. Is kswapd doing any work?</a></h3>
+<pre><code class="language-bash">grep -E 'pgsteal_kswapd|pgscan_kswapd|pswp' /proc/vmstat
+# Non-zero pgsteal_kswapd means active reclaim — system is under memory pressure
+</code></pre>
+<h3 id="9-drop-the-page-cache-and-watch-free-change"><a class="header" href="#9-drop-the-page-cache-and-watch-free-change">9. Drop the page cache and watch <code>free</code> change</a></h3>
+<pre><code class="language-bash"># Sync first to avoid dropping dirty data
+sync
+
+# Drop page cache, dentries, and inodes (3 = all)
+# This is SAFE — it's read-only metadata and clean file data
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# free will jump; buff/cache will drop
+free -h
+
+# The cache refills automatically as you read files
+</code></pre>
+<h3 id="10-oom-scores-across-the-system"><a class="header" href="#10-oom-scores-across-the-system">10. OOM scores across the system</a></h3>
+<pre><code class="language-bash"># Which process would the OOM killer target?
+ps -eo pid,oom_score,rss,comm --sort=-oom_score | head -10
+
+# Check if any process is protecting itself from OOM
+grep -r -l '\-1000' /proc/*/oom_score_adj 2&gt;/dev/null | head -5
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together"><a class="header" href="#putting-it-all-together">Putting It All Together</a></h2>
+<pre><code>Process writes to a new heap page
+    │
+    │  CPU walks page table → PTE not present
+    ▼
+Minor page fault
+    │  kernel allocates a physical frame (buddy allocator: order-0)
+    │  SLUB if kernel object; direct page if user allocation
+    │  zeroes the frame (security: no previous content leaks)
+    │  installs PTE: virtual page → physical frame, writable
+    │
+    ▼ frame is now in memory, process continues
+
+Process reads a file it hasn't opened before
+    │
+    │  read() → VFS → page cache lookup → miss
+    ▼
+Major page fault (or synchronous read)
+    │  block I/O reads the file's page from disk
+    │  page lands in page cache (indexed by inode + offset)
+    │  PTE installed (for mmap) or data copied to user buffer (for read())
+    │
+    ▼ page cache entry persists
+
+File page stays in page cache
+    │
+    ├── accessed again → serves from RAM, no disk I/O
+    │
+    └── memory pressure → kswapd
+        │
+        ├── page is clean → drop for free
+        │   (re-read from disk if accessed again → major fault)
+        │
+        └── page is dirty → writeback, then drop
+
+Anonymous page under pressure
+    │
+    └── kswapd writes to swap device
+        │  frame is freed
+        │  PTE updated: page-not-present (swap offset stored elsewhere)
+        │
+        └── process accesses the page again
+            │  major fault: read from swap → restore frame → PTE updated
+            ▼  slow, but correct
+
+Memory completely exhausted
+    │
+    └── OOM killer: select highest oom_score process → SIGKILL
+        frame freed, pressure relieved
+</code></pre>
+<p>The page cache is the unifying thread: <code>read()</code>, <code>write()</code>, <code>mmap()</code>, executable loading, and library sharing all flow through it. The kernel's job is to keep the working set of your running processes in RAM while using the rest for cache — and to reclaim that cache quietly, before you notice, whenever someone needs more memory.</p>
+<hr />
+<h2 id="whats-next"><a class="header" href="#whats-next">What's Next</a></h2>
+<p>In Chapter 5, we'll look at the <strong>scheduler</strong> — how the kernel decides which of many runnable processes gets CPU time. We've already seen <code>task_struct</code> and its <code>se.vruntime</code> field (CFS virtual runtime). Chapter 5 fills that in: what CFS virtual runtime means, how nice values translate to actual CPU share, what <code>load average</code> really measures, and how to diagnose scheduler-related latency.</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 
                     </main>
 

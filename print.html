@@ -234,7 +234,7 @@
     ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  PHASE 4 — initramfs                           ~15s         │
-│  Unlock LUKS → find root filesystem → pivot_root            │
+│  Unlock LUKS → find root filesystem → switch_root           │
 └─────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -257,7 +257,7 @@ Startup finished in 5.884s (firmware) + 2.696s (loader) + 1.614s (kernel)
 <p>How does <code>systemd-analyze</code> know these numbers? Each phase boundary is a measured handoff, not an estimate:</p>
 <ul>
 <li><strong>Kernel phase</strong>: When the kernel finishes its initialization and mounts the initramfs as the root filesystem, it records a timestamp to the monotonic clock. This marks the end of the "kernel" phase and the start of the "initrd" phase.</li>
-<li><strong>initrd and userspace phases</strong>: When systemd starts running (first inside initramfs, then as the real PID 1 after <code>pivot_root</code>), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.</li>
+<li><strong>initrd and userspace phases</strong>: When systemd starts running (first inside initramfs, then as the real PID 1 after <code>switch_root</code>), it records its own timestamps. The difference between these timestamps gives you the initrd and userspace durations.</li>
 </ul>
 <p>We'll use this data throughout.</p>
 <hr />
@@ -480,12 +480,25 @@ $ lsinitrd /boot/initramfs-6.19.11-200.fc43.x86_64.img | grep -E '\.(ko|service|
 <li>A minimal <code>/etc</code>, <code>/dev</code>, <code>/sys</code>, <code>/proc</code></li>
 </ul>
 <p><strong>dracut</strong> is Fedora's tool for building initramfs images. It takes a modular approach: you declare which "dracut modules" you need, and it assembles the minimal environment for your specific machine.</p>
+<p>dracut runs at three points in a system's life:</p>
+<ol>
+<li><strong>During OS installation</strong> — the installer calls dracut at the end to build an initramfs tailored to the hardware it just installed onto.</li>
+<li><strong>On every kernel update</strong> — when <code>dnf</code> installs a new kernel, a post-install hook automatically triggers dracut to build a matching initramfs. Kernel modules are version-specific, so the old initramfs won't work with the new kernel.</li>
+<li><strong>Manually, when you change low-level storage configuration</strong> — moving to a different machine, enabling LUKS, or installing early-boot drivers (like Nvidia) requires a fresh initramfs.</li>
+</ol>
 <pre><code class="language-bash"># Rebuild initramfs for the current kernel (run as root):
 dracut --force
 
 # See what dracut modules were included:
 lsinitrd /boot/initramfs-$(uname -r).img | grep 'dracut module'
 </code></pre>
+<h3 id="how-the-kernel-enters-initramfs"><a class="header" href="#how-the-kernel-enters-initramfs">How the kernel enters initramfs</a></h3>
+<p>After mounting the initramfs as its root filesystem, the kernel executes a single file: <strong><code>/init</code></strong>. Whatever that file is becomes PID 1.</p>
+<ul>
+<li>In older systems, <code>/init</code> was a shell script that sequentially unlocked storage, mounted the real root, and called <code>pivot_root</code>.</li>
+<li>In modern dracut-built initramfs images, <code>/init</code> is a symlink to a <strong>stripped-down systemd</strong>. This early systemd has one job: get to <code>/sysroot</code>. It doesn't start your network, desktop, or user services — just the storage and crypto units needed to mount the real root.</li>
+</ul>
+<p>Using systemd here rather than a script enables parallelism: it can simultaneously wait for a USB device to initialize, prompt for a LUKS passphrase, and assemble an LVM/RAID array.</p>
 <h3 id="luks-unlocking-in-the-initramfs"><a class="header" href="#luks-unlocking-in-the-initramfs">LUKS unlocking in the initramfs</a></h3>
 <p>This machine uses full-disk encryption. Look at the kernel command line again:</p>
 <pre><code>rd.luks.uuid=luks-5ea459ba-b7ec-439a-a3cf-7d25ff3b2889
@@ -498,9 +511,14 @@ lsinitrd /boot/initramfs-$(uname -r).img | grep 'dracut module'
 <li>Then mount <em>that</em> device as root</li>
 </ol>
 <p>This is why initramfs took <strong>15 seconds</strong> on this boot — a significant chunk of that is the time for the user to type a passphrase (or for a TPM to unseal a key). On an unencrypted system, initramfs skips the LUKS step entirely, and this phase drops from ~15s to ~2s. The initramfs image is also much smaller since <code>cryptsetup</code> and its dependencies aren't needed.</p>
-<h3 id="pivot_root-switching-to-the-real-root"><a class="header" href="#pivot_root-switching-to-the-real-root">pivot_root: switching to the real root</a></h3>
-<p>Once the real root filesystem is mounted (say, at <code>/sysroot</code> within the initramfs), the kernel performs a <strong>pivot_root</strong> operation: it atomically makes <code>/sysroot</code> the new root (<code>/</code>), and the old initramfs root becomes unreachable. After pivot_root, the kernel executes the real <code>/usr/lib/systemd/systemd</code> as PID 1.</p>
-<p>The initramfs is now gone from the filesystem tree. (It remains in RAM but its memory is reclaimed.)</p>
+<h3 id="switch_root-handing-off-to-the-real-filesystem"><a class="header" href="#switch_root-handing-off-to-the-real-filesystem">switch_root: handing off to the real filesystem</a></h3>
+<p>Once the real root filesystem is mounted at <code>/sysroot</code>, the initramfs systemd performs <strong><code>switch_root</code></strong> — a three-step operation:</p>
+<ol>
+<li><strong>Pivot</strong>: <code>/sysroot</code> becomes the new <code>/</code>. The old initramfs root is displaced.</li>
+<li><strong>Free</strong>: The initramfs is deleted from RAM, reclaiming its memory.</li>
+<li><strong>Exec</strong>: The real <code>/usr/lib/systemd/systemd</code> on disk is exec'd, taking over as PID 1.</li>
+</ol>
+<p>The key distinction from the lower-level <code>pivot_root</code> syscall: <code>switch_root</code> actively frees the initramfs memory and is performed by systemd inside the initramfs — the kernel doesn't do this on its own. Notably, <code>switch_root</code> doesn't even call the <code>pivot_root</code> syscall under the hood — it uses <code>mount --move</code> (<code>MS_MOVE</code>) instead, which relocates the mount point without the namespace gymnastics that <code>pivot_root</code> requires.</p>
 <hr />
 <h2 id="phase-5--systemd-the-init-system"><a class="header" href="#phase-5--systemd-the-init-system">Phase 5 — systemd: The Init System</a></h2>
 <h3 id="pid-1s-job"><a class="header" href="#pid-1s-job">PID 1's job</a></h3>
@@ -670,7 +688,7 @@ journalctl -b -u NetworkManager.service
        Prompts for passphrase / unseals TPM key
        cryptsetup luksOpen → creates /dev/mapper/luks-...
        Mounts Btrfs filesystem, subvolume "root", at /sysroot
-       pivot_root: /sysroot becomes new /
+       switch_root: /sysroot becomes new /, initramfs freed from RAM
        Exec real /usr/lib/systemd/systemd
     │
     ▼  systemd (PID 1) reads unit files
@@ -1081,11 +1099,1510 @@ journalctl -u NetworkManager.service -p err
 <hr />
 <p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-3-processes--fork-exec-and-the-process-table"><a class="header" href="#linux-deep-dive-3-processes--fork-exec-and-the-process-table">Linux Deep Dive #3: Processes — fork, exec, and the Process Table</a></h1>
-<p><em>Coming soon.</em></p>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>You've been using processes since you first typed a command. But what <em>is</em> a process, really?</p>
+<p>Not "a running program" — that's the textbook answer, and it's too vague to be useful. A process is a specific data structure in kernel memory, a virtual address space, a set of open file descriptors, and a position in a tree that traces back to PID 1. Understanding what the kernel actually stores — and what happens when you call <code>fork()</code> or <code>exec()</code> — gives you a mental model that makes everything else click: why forking is fast, how exec replaces a program without changing its PID, why zombie processes exist, and what threads actually are under the hood.</p>
+<p>This post traces the lifecycle of a process from <code>fork()</code> to <code>exit()</code>, using the kernel source and <code>/proc</code> as our specimen jars.</p>
+<hr />
+<h2 id="the-process-at-a-glance"><a class="header" href="#the-process-at-a-glance">The Process at a Glance</a></h2>
+<p>Before drilling in, here's the lifecycle we'll trace:</p>
+<pre><code>Parent process calls fork()
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  fork()                                                      │
+│  Kernel creates a new task_struct for the child             │
+│  CoW: parent and child share physical pages (read-only)     │
+│  Child gets a new PID; parent gets child's PID back         │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │  (child continues here — fork() returned 0)
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  exec()                                                      │
+│  Child replaces its virtual address space with new program  │
+│  Old code/data/stack gone; new ELF loaded                   │
+│  PID unchanged, some file descriptors inherited             │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Process runs                                                │
+│  Scheduled on CPU, makes syscalls, handles signals          │
+│  task_struct tracks state: R, S, D, T, Z                   │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │  process calls exit() or is killed
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Zombie state                                                │
+│  Memory freed, but task_struct remains                      │
+│  Parent calls wait() → kernel reaps the zombie              │
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="the-task_struct-what-the-kernel-stores"><a class="header" href="#the-task_struct-what-the-kernel-stores">The task_struct: What the Kernel Stores</a></h2>
+<p>Every process and thread on a Linux system has exactly one <strong><code>task_struct</code></strong> — the kernel's complete record of that execution context. It lives in kernel memory, allocated when the process is created and freed when the parent reaps it with <code>wait()</code>.</p>
+<p>The <code>task_struct</code> is defined in <code>include/linux/sched.h</code>. It's large — hundreds of fields. The ones that matter most:</p>
+<pre><code class="language-c">struct task_struct {
+    /* State */
+    unsigned int        __state;     /* TASK_RUNNING, TASK_INTERRUPTIBLE, ... */
+
+    /* Identity */
+    pid_t               pid;         /* process ID */
+    pid_t               tgid;        /* thread group ID (= pid for single-threaded) */
+
+    /* Family */
+    struct task_struct *parent;      /* parent process */
+    struct list_head    children;    /* list of child processes */
+    struct list_head    sibling;     /* position in parent's children list */
+
+    /* Memory */
+    struct mm_struct   *mm;          /* virtual address space descriptor */
+
+    /* Files */
+    struct files_struct *files;      /* open file descriptor table */
+    struct fs_struct    *fs;         /* filesystem context: cwd, root, umask */
+
+    /* Credentials */
+    const struct cred  *cred;        /* UID, GID, capabilities */
+
+    /* Signals */
+    struct signal_struct *signal;    /* signal handlers, pending signals */
+
+    /* Scheduling */
+    int                 prio;        /* scheduling priority */
+    u64                 se.vruntime; /* CFS virtual runtime (more in Chapter 5) */
+};
+</code></pre>
+<p>This is the nucleus of the entire process model. When you run <code>ps</code>, it reads <code>/proc/[pid]/stat</code>, which is synthesized from the <code>task_struct</code>. When the scheduler picks the next process to run, it's choosing between <code>task_struct</code>s. When you send a signal with <code>kill</code>, the kernel sets a bit in the target's <code>task_struct</code>.</p>
+<p>The <code>mm</code> pointer (memory descriptor) points to <code>mm_struct</code>, which describes the entire virtual address space. The <code>files</code> pointer points to the open file descriptor table. Both of these can be <em>shared</em> between <code>task_struct</code>s — that's what threads are, as we'll see.</p>
+<hr />
+<h2 id="exploring-processes-via-proc"><a class="header" href="#exploring-processes-via-proc">Exploring Processes via /proc</a></h2>
+<p>The kernel exposes every <code>task_struct</code> through the <strong><code>/proc</code> filesystem</strong>. For every running process, there's a directory <code>/proc/[pid]/</code>:</p>
+<pre><code class="language-bash">$ ls /proc/1/
+attr/     cmdline  environ  fd/   maps  mountstats  ns/      root
+cgroup    comm     exe      io    mem   net/         oom_adj  smaps
+coredump_filter    gid_map  ...   mounts             pagemap  stat  status
+</code></pre>
+<p>The most useful files:</p>
+<pre><code class="language-bash"># What command is PID 1?
+$ cat /proc/1/cmdline | tr '\0' ' '
+/usr/lib/systemd/systemd --switched-root --system --deserialize 31
+
+# Human-readable status
+$ cat /proc/1/status
+Name:   systemd
+Umask:  0000
+State:  S (sleeping)
+Tgid:   1
+Pid:    1
+PPid:   0
+...
+VmRSS:  15348 kB
+Threads:        1
+
+# All open file descriptors of NetworkManager
+$ ls -la /proc/1618/fd/ | head -8
+lrwx------. 1 root root 64 Apr 23 09:12 0 -&gt; /dev/null
+lrwx------. 1 root root 64 Apr 23 09:12 1 -&gt; /dev/null
+lrwx------. 1 root root 64 Apr 23 09:12 2 -&gt; /dev/null
+lrwx------. 1 root root 64 Apr 23 09:12 4 -&gt; 'socket:[28431]'
+lrwx------. 1 root root 64 Apr 23 09:12 5 -&gt; 'socket:[28432]'
+</code></pre>
+<p>(PID 1618 is NetworkManager on this system, as established in Chapter 2.)</p>
+<p>The <code>/proc/[pid]/maps</code> file shows the full virtual address space:</p>
+<pre><code class="language-bash">$ cat /proc/1618/maps | head -12
+55f8e4d20000-55f8e4d7a000 r--p 00000000 fd:01 524302  /usr/bin/NetworkManager
+55f8e4d7a000-55f8e5012000 r-xp 0005a000 fd:01 524302  /usr/bin/NetworkManager
+55f8e5012000-55f8e5134000 r--p 002f2000 fd:01 524302  /usr/bin/NetworkManager
+55f8e5134000-55f8e5141000 rw-p 00413000 fd:01 524302  /usr/bin/NetworkManager
+55f8e67a3000-55f8e6a1b000 rw-p 00000000 00:00 0       [heap]
+7f9b3c000000-7f9b3c021000 rw-p 00000000 00:00 0
+7ffce2a3c000-7ffce2a5e000 rw-p 00000000 00:00 0       [stack]
+7ffce2b76000-7ffce2b78000 r-xp 00000000 00:00 0       [vdso]
+</code></pre>
+<p>Each line is a <strong>VMA</strong> (Virtual Memory Area) — a contiguous range of virtual addresses with a single set of permissions. <code>r-xp</code> means read + execute + private (not shared). The executable has separate VMAs for the read-only text segment, the writable data segment, the heap, and the stack. Chapter 4 goes deep on this.</p>
+<hr />
+<h2 id="the-process-tree"><a class="header" href="#the-process-tree">The Process Tree</a></h2>
+<p>Every process except PID 1 has a parent. The parent-child relationship forms a tree rooted at systemd:</p>
+<pre><code class="language-bash">$ pstree -p | head -20
+systemd(1)─┬─ModemManager(1203)─┬─{ModemManager}(1221)
+           │                     └─{ModemManager}(1222)
+           ├─NetworkManager(1618)─┬─{NetworkManager}(1636)
+           │                      └─{NetworkManager}(1637)
+           ├─dbus-broker(1432)
+           ├─gdm(1801)─┬─gdm-session-wor(2015)
+           │            └─{gdm}(1803)
+           ├─kthreadd(2)─┬─kworker/0:0H(12)
+           │              ├─ksoftirqd/0(9)
+           │              └─...
+           └─...
+</code></pre>
+<p>The <code>{...}</code> entries — like <code>{NetworkManager}(1636)</code> — are threads. Multiple <code>task_struct</code>s sharing the same memory space appear under their process as thread entries.</p>
+<p>Notice PID 2 (<code>kthreadd</code>). Kernel threads — <code>kworker</code>, <code>ksoftirqd</code>, <code>ksystemd-udevd</code> — all descend from PID 2 and never enter user space. Their <code>mm</code> pointer is NULL; they only ever run kernel code.</p>
+<p>You can walk the parent chain manually through <code>/proc</code>:</p>
+<pre><code class="language-bash"># Who is NetworkManager's parent?
+$ cat /proc/1618/status | grep PPid
+PPid:   1
+
+# Shell in a shell: check your current PID and its parent
+$ echo $$
+47234
+
+$ cat /proc/47234/status | grep -E '^(Pid|PPid)'
+Pid:    47234
+PPid:   47198
+
+$ cat /proc/47198/status | grep -E '^(Name|Pid)'
+Name:   bash
+Pid:    47198
+</code></pre>
+<hr />
+<h2 id="fork-creating-a-new-process"><a class="header" href="#fork-creating-a-new-process">fork(): Creating a New Process</a></h2>
+<p><code>fork()</code> is the only way to create a new process in Linux. Every process you've ever seen — every shell command, every daemon, every application — was created by a <code>fork()</code> call somewhere in its ancestry.</p>
+<h3 id="the-syscall"><a class="header" href="#the-syscall">The syscall</a></h3>
+<p>At the C library level, <code>fork()</code> is a function that returns twice: once in the parent, once in the child:</p>
+<pre><code class="language-c">pid_t pid = fork();
+if (pid == 0) {
+    // We're in the child — fork() returned 0
+    printf("child PID: %d\n", getpid());
+    exit(0);
+} else if (pid &gt; 0) {
+    // We're in the parent — pid is the child's PID
+    printf("parent sees child PID: %d\n", pid);
+    wait(NULL);  // wait for child to exit
+} else {
+    // pid == -1: fork failed (ENOMEM, EAGAIN, etc.)
+    perror("fork");
+}
+</code></pre>
+<p>Under the hood, glibc's <code>fork()</code> calls the <strong><code>clone()</code></strong> syscall — the real workhorse. <code>fork()</code> is <code>clone()</code> with a specific set of flags:</p>
+<pre><code class="language-c">// What fork() does internally (simplified):
+clone(SIGCHLD, 0);
+</code></pre>
+<p><code>clone()</code> gives fine-grained control over what the child shares with the parent. <code>fork()</code> shares nothing (new memory space, new FD table copy). <code>pthread_create()</code> shares almost everything. Same syscall, different flags.</p>
+<h3 id="what-the-kernel-does-on-fork"><a class="header" href="#what-the-kernel-does-on-fork">What the kernel does on fork()</a></h3>
+<p>The kernel executes <code>copy_process()</code> in <code>kernel/fork.c</code>. The steps:</p>
+<pre><code>clone() syscall
+    │
+    ├── Allocate a new task_struct for the child
+    │
+    ├── Copy the parent's task_struct fields
+    │   ├── pid  ← new PID, assigned from the PID namespace
+    │   ├── ppid ← parent's PID
+    │   └── state ← TASK_RUNNING
+    │
+    ├── copy_mm() ── duplicate the virtual address space (CoW — see below)
+    │
+    ├── copy_files() ── copy the file descriptor table
+    │   (child gets the same FD numbers, pointing to same open file entries)
+    │
+    ├── copy_fs() ── copy the filesystem context
+    │   (child inherits parent's cwd, root, umask)
+    │
+    ├── copy_sighand() ── copy signal handlers
+    │
+    └── Place child on the scheduler's run queue
+</code></pre>
+<p>After <code>copy_process()</code> returns, the kernel returns the child's PID to the parent, and the child is placed on the run queue. Both parent and child are now runnable; the scheduler decides which goes first.</p>
+<h3 id="the-child-starts-where-fork-was-called"><a class="header" href="#the-child-starts-where-fork-was-called">The child starts where fork() was called</a></h3>
+<p>The child doesn't start at <code>main()</code>. It starts at the exact instruction after <code>fork()</code> returned, with a copy of the parent's entire register state — stack pointer, instruction pointer, everything. This is how fork can "return twice": from the child's perspective it woke up having just returned from a syscall with 0 in <code>rax</code>, so <code>fork()</code> returns 0.</p>
+<hr />
+<h2 id="copy-on-write-why-fork-is-fast"><a class="header" href="#copy-on-write-why-fork-is-fast">Copy-on-Write: Why fork() Is Fast</a></h2>
+<p>Duplicating a process's virtual address space sounds expensive — a process might have gigabytes of memory mapped. Copying it all on every <code>fork()</code> would make shells unusable.</p>
+<p>The solution is <strong>copy-on-write (CoW)</strong>.</p>
+<p>When <code>fork()</code> calls <code>copy_mm()</code>, it doesn't copy physical memory pages. Instead:</p>
+<ol>
+<li>The parent's page table entries are duplicated — the child gets its own page table pointing to the <em>same physical pages</em>.</li>
+<li>Both the parent's and child's PTEs for those pages are marked <strong>read-only</strong>.</li>
+<li>If either process writes to a shared page, a <strong>page fault</strong> fires.</li>
+<li>The page fault handler sees this is a CoW fault: it allocates a new physical page, copies the content, updates the faulting process's PTE to point to the new page (with write permission restored), and resumes execution.</li>
+</ol>
+<p>The result: <code>fork()</code> costs roughly the time to copy the page table structures — not the pages themselves. You pay only for pages that actually get written after the fork.</p>
+<pre><code>Before fork():
+Parent VMAs                  Physical RAM
+  PTE: 0x1000 → frame A ←── [frame A: code/data]
+  PTE: 0x2000 → frame B ←── [frame B: data]
+
+After fork() — CoW setup:
+Parent VMAs                  Physical RAM
+  PTE: 0x1000 → frame A (ro) ←── [frame A: code/data]   ← same frame
+  PTE: 0x2000 → frame B (ro) ←── [frame B: data]         ← same frame
+Child VMAs                           ↑
+  PTE: 0x1000 → frame A (ro) ────────┘
+  PTE: 0x2000 → frame B (ro) ─────────────────────────────┘
+
+After child writes to 0x2000 (page fault → CoW copy):
+Parent VMAs                  Physical RAM
+  PTE: 0x1000 → frame A (ro) ←── [frame A: code/data]   (unchanged)
+  PTE: 0x2000 → frame B (ro) ←── [frame B: original]    (unchanged)
+Child VMAs
+  PTE: 0x1000 → frame A (ro) ←── [frame A: code/data]   (still shared)
+  PTE: 0x2000 → frame C (rw) ←── [frame C: modified]    (new copy)
+</code></pre>
+<p>If you immediately call <code>exec()</code> after <code>fork()</code> — the common case for shells — the child's address space is thrown away before it writes anything. CoW means this common path allocates almost no physical memory at all.</p>
+<hr />
+<h2 id="exec-replacing-the-process-image"><a class="header" href="#exec-replacing-the-process-image">exec(): Replacing the Process Image</a></h2>
+<p><code>fork()</code> creates a copy. <code>exec()</code> replaces a process's program with a different one.</p>
+<h3 id="the-syscall-1"><a class="header" href="#the-syscall-1">The syscall</a></h3>
+<pre><code class="language-c">execve("/usr/bin/ls", (char *[]){"/usr/bin/ls", "-la", NULL},
+       environ);
+// If execve returns, something went wrong
+perror("execve");
+exit(127);
+</code></pre>
+<p><code>execve()</code> takes three arguments: the path to the new program, the argument array (<code>argv</code>), and the environment array (<code>envp</code>). If it succeeds, it <strong>never returns</strong> — the calling process's virtual address space is completely replaced.</p>
+<h3 id="what-the-kernel-does-on-exec"><a class="header" href="#what-the-kernel-does-on-exec">What the kernel does on exec()</a></h3>
+<p>The kernel's <code>do_execve()</code> in <code>fs/exec.c</code>:</p>
+<pre><code>execve() syscall
+    │
+    ├── Open and read the target file
+    │   Starts with #! (shebang)? → redirect to the interpreter
+    │   Looks like an ELF binary? → call the ELF loader
+    │
+    ├── Flush the old virtual address space
+    │   (all VMAs unmapped, page tables cleared, mm_struct reset)
+    │
+    ├── Load the new ELF binary:
+    │   ├── Map text segment (r-xp) into virtual memory
+    │   ├── Map data segment (rw-p) into virtual memory
+    │   ├── Set up a new stack
+    │   └── Dynamically linked? → map ld.so first; it loads libraries
+    │
+    ├── Push argc, argv, envp onto the new stack
+    │
+    ├── Set instruction pointer to the ELF entry point
+    │
+    └── Return to user space at _start()
+</code></pre>
+<p>The key: the PID does not change. The <code>task_struct</code> is the same one. What changed is the <code>mm</code> field — the old memory descriptor is gone, replaced with one describing the new program's address space.</p>
+<pre><code class="language-bash"># exec() replaces the program but keeps the PID
+$ echo $$
+47234
+
+$ exec bash       # replace this bash with a new bash
+$ echo $$
+47234             # same PID — exec() doesn't create a new process
+</code></pre>
+<h3 id="what-exec-preserves"><a class="header" href="#what-exec-preserves">What exec() preserves</a></h3>
+<p>Despite replacing everything, exec carries forward some state:</p>
+<div class="table-wrapper"><table><thead><tr><th>Preserved</th><th>Discarded</th></tr></thead><tbody>
+<tr><td>PID, PPID</td><td>Virtual address space</td></tr>
+<tr><td>Open file descriptors (unless <code>O_CLOEXEC</code>)</td><td>Memory mappings</td></tr>
+<tr><td>Real UID/GID</td><td>Signal handlers (reset to default)</td></tr>
+<tr><td>Ignored signals</td><td></td></tr>
+<tr><td>cwd, root directory</td><td></td></tr>
+<tr><td>Resource limits (<code>ulimit</code>)</td><td></td></tr>
+</tbody></table>
+</div>
+<p>The <code>O_CLOEXEC</code> flag tells the kernel to close an FD when exec happens. Modern code sets it on almost every FD that shouldn't leak into child programs — sockets, pipe ends, anything sensitive.</p>
+<hr />
+<h2 id="the-fork--exec-pattern"><a class="header" href="#the-fork--exec-pattern">The fork + exec Pattern</a></h2>
+<p>The standard Unix pattern for running a program is the <strong>fork-exec idiom</strong>:</p>
+<pre><code class="language-c">pid_t pid = fork();
+if (pid == 0) {
+    // Child: set up redirections/pipes, then exec
+    dup2(pipe_fd[1], STDOUT_FILENO);  // redirect stdout to pipe
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
+    execvp("ls", argv);
+    exit(127);  // only reached if exec fails
+} else {
+    // Parent: manages the child
+    close(pipe_fd[1]);
+    read(pipe_fd[0], buf, sizeof(buf));
+    wait(NULL);
+}
+</code></pre>
+<p>This is exactly how your shell works. When you type <code>ls -la</code>:</p>
+<pre><code>bash (PID 47234)
+    │  calls fork()
+    ├──────────────────────────────────┐
+    │                                  ▼
+    │                         bash (PID 47235)  ← child copy
+    │                                  │  sets up redirections
+    │                                  │  calls execve("/usr/bin/ls", ...)
+    │                                  ▼
+    │                         ls (PID 47235)    ← same PID, new program
+    │                                  │  runs, writes output
+    │                                  │  exits(0)
+    │                                  │
+    │  wait() returns ─────────────────┘
+    ▼
+bash (PID 47234)  ← resumes with exit status
+</code></pre>
+<p>The genius of this design: all the setup work (redirections, pipe wiring, environment changes) happens in the child <em>after</em> fork but <em>before</em> exec. The parent doesn't have to know about any of it.</p>
+<p>You can watch every <code>execve()</code> call a command makes:</p>
+<pre><code class="language-bash">$ strace -e execve bash -c 'ls /tmp' 2&gt;&amp;1
+execve("/bin/bash", ["bash", "-c", "ls /tmp"], 0x... /* environ */)
+...
+[pid 47235] execve("/usr/bin/ls", ["ls", "/tmp"], 0x... /* environ */)
+</code></pre>
+<p>Two <code>execve</code> calls: one for bash itself at startup, one for <code>ls</code> inside bash.</p>
+<hr />
+<h2 id="process-states"><a class="header" href="#process-states">Process States</a></h2>
+<p>Every process is always in one of a handful of states. The <code>__state</code> field in <code>task_struct</code> tracks this:</p>
+<pre><code>TASK_RUNNING (R)
+    The process is either running on a CPU right now,
+    or sitting in a run queue waiting for a CPU.
+    Both cases show as 'R' in ps.
+
+TASK_INTERRUPTIBLE (S)
+    Sleeping, waiting for an event: I/O complete, timer,
+    mutex, network data, etc. CAN be woken by a signal.
+
+TASK_UNINTERRUPTIBLE (D)
+    Sleeping, waiting for an event. CANNOT be interrupted
+    by signals — not even SIGKILL. Typically waiting on
+    disk I/O, kernel locks, or NFS. A process stuck in D
+    state usually means a device or mount isn't responding.
+
+__TASK_STOPPED (T)
+    Stopped by SIGSTOP or job control (Ctrl+Z).
+    Resumes on SIGCONT.
+
+EXIT_ZOMBIE (Z)
+    Has exited, but parent hasn't called wait() yet.
+    No memory, no CPU time — just the task_struct remains
+    to hold the exit status.
+</code></pre>
+<p>You see these in <code>ps</code> output:</p>
+<pre><code class="language-bash">$ ps aux | head -12
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0 173936 15348 ?        Ss   Apr22   0:01 /usr/lib/systemd/systemd
+root           2  0.0  0.0      0     0 ?        S    Apr22   0:00 [kthreadd]
+root           9  0.0  0.0      0     0 ?        S    Apr22   0:00 [ksoftirqd/0]
+root        1432  0.0  0.0  10604  5124 ?        Ss   Apr22   0:00 /usr/bin/dbus-broker
+root        1618  0.0  0.1  54680 18204 ?        Ss   Apr22   0:01 /usr/bin/NetworkManager
+xiaofeng   47234  0.0  0.0  14228  8316 pts/0    Ss   09:15   0:00 -bash
+</code></pre>
+<p>The <code>STAT</code> column encodes state plus modifiers:</p>
+<div class="table-wrapper"><table><thead><tr><th>Letter</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>R</code></td><td>Running or runnable</td></tr>
+<tr><td><code>S</code></td><td>Interruptible sleep</td></tr>
+<tr><td><code>D</code></td><td>Uninterruptible sleep (disk/kernel wait)</td></tr>
+<tr><td><code>Z</code></td><td>Zombie</td></tr>
+<tr><td><code>T</code></td><td>Stopped</td></tr>
+<tr><td><code>I</code></td><td>Idle kernel thread</td></tr>
+<tr><td><code>s</code></td><td>Session leader</td></tr>
+<tr><td><code>l</code></td><td>Multi-threaded</td></tr>
+<tr><td><code>+</code></td><td>Foreground process group</td></tr>
+<tr><td><code>N</code></td><td>Low priority (nice &gt; 0)</td></tr>
+</tbody></table>
+</div>
+<p><code>D</code> state is worth understanding on its own. A process in D state <strong>cannot be killed</strong> — not even with <code>SIGKILL</code>. The signal is queued, but the process can't check it until the kernel operation it's waiting for completes. If a disk or NFS mount stops responding, processes waiting on I/O pile up in D state and stay there until the device responds or the mount is force-unmounted.</p>
+<pre><code class="language-bash"># Find D-state processes (usually none; if you see them, investigate the mount or device):
+$ ps aux | awk '$8 ~ /^D/'
+</code></pre>
+<hr />
+<h2 id="threads-processes-that-share-memory"><a class="header" href="#threads-processes-that-share-memory">Threads: Processes That Share Memory</a></h2>
+<p>So far, "process" and "task_struct" have been interchangeable. But what about threads?</p>
+<p>In Linux, there's no fundamental distinction between a process and a thread at the kernel level. <strong>A thread is just a <code>task_struct</code> that shares its <code>mm</code> (virtual address space) with another <code>task_struct</code>.</strong></p>
+<p>This sharing is controlled by the flags passed to <code>clone()</code>:</p>
+<pre><code class="language-c">// fork(): new address space, new FD table, new everything
+clone(SIGCHLD, 0);
+
+// pthread_create(): shared address space, shared FDs, shared signal handlers
+clone(CLONE_VM | CLONE_FILES | CLONE_FS | CLONE_SIGHAND |
+      CLONE_THREAD | CLONE_SETTLS, stack_ptr);
+</code></pre>
+<p>When you call <code>pthread_create()</code>, glibc calls <code>clone()</code> with the flags above. The result is a new <code>task_struct</code> — its own kernel entity, its own PID, schedulable independently — but with the <code>mm</code> pointer pointing to the <em>same</em> <code>mm_struct</code> as the creating thread. They share one virtual address space.</p>
+<p>From the kernel's perspective, threads and processes are the same thing. Both are <code>task_struct</code>s. Both get scheduled by the same CFS scheduler. Both appear in <code>/proc</code>. The <code>tgid</code> field (thread group ID) ties them together: all threads in a process share the same <code>tgid</code>, which equals the PID of the first thread.</p>
+<pre><code class="language-bash"># NetworkManager is multi-threaded
+$ cat /proc/1618/status | grep -E '(Tgid|Pid|Threads)'
+Tgid:   1618
+Pid:    1618
+Threads:        3
+
+# The threads are visible under /proc/1618/task/
+$ ls /proc/1618/task/
+1618  1636  1637
+
+# Thread 1636 has its own PID but the same TGID
+$ cat /proc/1636/status | grep -E '(Tgid|Pid)'
+Tgid:   1618
+Pid:    1636
+</code></pre>
+<p><code>/proc/1618/task/</code> lists all threads in the thread group. Thread 1618 is the main thread (its PID equals the TGID); 1636 and 1637 are worker threads with their own PIDs but sharing the same memory space.</p>
+<p>This architecture — threads as <code>clone()</code>d task_structs — is why Linux doesn't need separate thread scheduling code. The CFS scheduler handles both.</p>
+<hr />
+<h2 id="zombies-and-reaping"><a class="header" href="#zombies-and-reaping">Zombies and Reaping</a></h2>
+<p>When a process calls <code>exit()</code> (or is killed by a signal), the kernel:</p>
+<ol>
+<li>Frees all its memory (pages, page tables, VMAs)</li>
+<li>Closes all open file descriptors</li>
+<li>Detaches from its thread group</li>
+<li>Changes <code>__state</code> to <code>EXIT_ZOMBIE</code></li>
+<li>Sends <code>SIGCHLD</code> to the parent</li>
+</ol>
+<p>The <code>task_struct</code> is kept alive in zombie state so the parent can retrieve the exit status. The parent does this by calling <code>wait()</code> or <code>waitpid()</code>:</p>
+<pre><code class="language-c">int status;
+pid_t child = wait(&amp;status);
+
+if (WIFEXITED(status)) {
+    printf("exited normally, status %d\n", WEXITSTATUS(status));
+} else if (WIFSIGNALED(status)) {
+    printf("killed by signal %d\n", WTERMSIG(status));
+}
+</code></pre>
+<p>Once <code>wait()</code> returns, the kernel removes the zombie's <code>task_struct</code>. This is called <strong>reaping</strong> the zombie.</p>
+<h3 id="what-if-the-parent-never-calls-wait"><a class="header" href="#what-if-the-parent-never-calls-wait">What if the parent never calls wait()?</a></h3>
+<p>If a parent exits without reaping its children, those children are <strong>reparented</strong> to PID 1 (systemd). systemd calls <code>waitpid()</code> on any process reparented to it, so they get reaped promptly. This is one of the reasons PID 1 must never crash — if it did, unreapable zombies would accumulate until the system ran out of PID space.</p>
+<p>If the parent stays alive but never calls <code>wait()</code>, zombies accumulate. Each zombie is a <code>task_struct</code> still consuming kernel memory:</p>
+<pre><code class="language-bash"># Find zombie processes (on a healthy system, there should be none):
+$ ps aux | awk '$8 == "Z"'
+
+# The PPID points to the process that should be reaping:
+$ ps -eo pid,ppid,stat,comm | awk '$3 ~ /Z/'
+</code></pre>
+<hr />
+<h2 id="signals-asynchronous-notifications"><a class="header" href="#signals-asynchronous-notifications">Signals: Asynchronous Notifications</a></h2>
+<p>Signals are the kernel's mechanism for asynchronous notification. A signal can be sent by the kernel (e.g., <code>SIGSEGV</code> on a segfault, <code>SIGCHLD</code> when a child exits), by another process (<code>kill -9 1234</code>), or by the user (Ctrl+C sends <code>SIGINT</code>).</p>
+<h3 id="how-signals-are-delivered"><a class="header" href="#how-signals-are-delivered">How signals are delivered</a></h3>
+<p>When a signal is sent to a process:</p>
+<ol>
+<li>The kernel sets a bit in the process's <strong>pending signal bitmask</strong> (<code>task_struct → pending</code>)</li>
+<li>The next time the process is scheduled or returns from a syscall, the kernel checks for pending signals</li>
+<li>If a signal is pending and not blocked, the kernel delivers it</li>
+</ol>
+<p>Delivery means one of:</p>
+<ul>
+<li><strong>Default action</strong>: terminate, terminate+core dump, ignore, stop, or continue — depending on the signal</li>
+<li><strong>Custom handler</strong>: if the process called <code>sigaction()</code> to install a handler, the kernel redirects execution to it</li>
+</ul>
+<p>The common signals:</p>
+<div class="table-wrapper"><table><thead><tr><th>Signal</th><th>Default</th><th>Triggered by</th></tr></thead><tbody>
+<tr><td><code>SIGHUP</code></td><td>Terminate</td><td>Controlling terminal closed</td></tr>
+<tr><td><code>SIGINT</code></td><td>Terminate</td><td>Ctrl+C</td></tr>
+<tr><td><code>SIGQUIT</code></td><td>Core dump</td><td>Ctrl+\</td></tr>
+<tr><td><code>SIGKILL</code></td><td>Terminate</td><td>Cannot be caught or ignored</td></tr>
+<tr><td><code>SIGSEGV</code></td><td>Core dump</td><td>Invalid memory access</td></tr>
+<tr><td><code>SIGTERM</code></td><td>Terminate</td><td>Polite termination request</td></tr>
+<tr><td><code>SIGCHLD</code></td><td>Ignore</td><td>Child exited or stopped</td></tr>
+<tr><td><code>SIGSTOP</code></td><td>Stop</td><td>Cannot be caught or ignored</td></tr>
+<tr><td><code>SIGCONT</code></td><td>Continue</td><td>Resume a stopped process</td></tr>
+<tr><td><code>SIGPIPE</code></td><td>Terminate</td><td>Write to a closed pipe</td></tr>
+</tbody></table>
+</div>
+<h3 id="sigkill-and-sigstop-cannot-be-caught"><a class="header" href="#sigkill-and-sigstop-cannot-be-caught">SIGKILL and SIGSTOP cannot be caught</a></h3>
+<p>These two signals are special: no process can install a handler for them, block them, or ignore them. This gives the system a guaranteed way to kill or stop any process regardless of its state or what code it's running.</p>
+<p>This is also why killing a D-state process doesn't work: <code>SIGKILL</code> is queued (the bit is set in the pending bitmask), but the process is in uninterruptible sleep and won't check pending signals until the kernel operation it's waiting for completes.</p>
+<h3 id="sending-signals"><a class="header" href="#sending-signals">Sending signals</a></h3>
+<pre><code class="language-bash"># By PID:
+kill -SIGTERM 1618      # ask NetworkManager to stop gracefully
+kill -SIGKILL 1618      # force it
+
+# By name (resolves PID automatically):
+pkill NetworkManager
+killall -SIGTERM bash
+
+# Check what a signal number means:
+kill -l 9               # prints KILL
+</code></pre>
+<h3 id="inspecting-signal-state"><a class="header" href="#inspecting-signal-state">Inspecting signal state</a></h3>
+<pre><code class="language-bash"># What signals does NetworkManager have blocked/ignored?
+$ grep -E '^Sig' /proc/1618/status
+SigQ:   0/59282
+SigPnd: 0000000000000000
+SigBlk: 0000000000001000
+SigIgn: 0000000000003003
+SigCgt: 0000000000010002
+</code></pre>
+<p>These are 64-bit bitmasks, one bit per signal. <code>SigBlk</code> (blocked) and <code>SigIgn</code> (ignored) are set by the process through <code>sigprocmask()</code> and <code>sigaction()</code>. You can decode them:</p>
+<pre><code class="language-bash">$ python3 -c "
+blocked = 0x0000000000001000
+for i in range(64):
+    if blocked &amp; (1 &lt;&lt; i):
+        print(f'  signal {i+1} is blocked')
+"
+  signal 13 is blocked    # SIGPIPE — NetworkManager ignores broken pipes
+</code></pre>
+<hr />
+<h2 id="try-it-yourself-2"><a class="header" href="#try-it-yourself-2">Try It Yourself</a></h2>
+<h3 id="1-explore-the-full-process-tree"><a class="header" href="#1-explore-the-full-process-tree">1. Explore the full process tree</a></h3>
+<pre><code class="language-bash">pstree -p | less
+</code></pre>
+<h3 id="2-inspect-any-processs-complete-state"><a class="header" href="#2-inspect-any-processs-complete-state">2. Inspect any process's complete state</a></h3>
+<pre><code class="language-bash">cat /proc/1618/status
+cat /proc/1618/cmdline | tr '\0' ' '
+ls -la /proc/1618/fd/
+cat /proc/1618/maps | head -20
+</code></pre>
+<h3 id="3-watch-fork-and-exec-at-the-syscall-level"><a class="header" href="#3-watch-fork-and-exec-at-the-syscall-level">3. Watch fork() and exec() at the syscall level</a></h3>
+<pre><code class="language-bash">strace -e clone,execve,wait4 bash -c 'ls /tmp' 2&gt;&amp;1 | head -20
+</code></pre>
+<h3 id="4-observe-copy-on-write-in-action"><a class="header" href="#4-observe-copy-on-write-in-action">4. Observe copy-on-write in action</a></h3>
+<pre><code class="language-bash"># Fork a process that holds 50MB but doesn't write anything
+python3 -c "
+import os, time
+data = bytearray(50 * 1024 * 1024)
+pid = os.fork()
+if pid == 0:
+    print('child PID:', os.getpid())
+    time.sleep(30)
+else:
+    print('parent PID:', os.getpid())
+    time.sleep(30)
+" &amp;
+
+# While it sleeps, check VmRSS and RssAnon for both PIDs:
+# Both will show ~50MB VmRSS, but they share the physical frames
+grep -E '(VmRSS|RssAnon)' /proc/$BGPID/status
+</code></pre>
+<h3 id="5-create-a-zombie-intentionally"><a class="header" href="#5-create-a-zombie-intentionally">5. Create a zombie intentionally</a></h3>
+<pre><code class="language-bash">python3 -c "
+import os, time
+pid = os.fork()
+if pid == 0:
+    os._exit(0)      # child exits immediately
+else:
+    time.sleep(30)   # parent doesn't call wait()
+" &amp;
+
+ps aux | awk '$8 == "Z"'   # zombie appears here
+</code></pre>
+<h3 id="6-explore-threads-of-a-multi-threaded-process"><a class="header" href="#6-explore-threads-of-a-multi-threaded-process">6. Explore threads of a multi-threaded process</a></h3>
+<pre><code class="language-bash">ls /proc/1618/task/            # one directory per thread
+ps -eLf | grep 1618            # threads in ps format (LWP column)
+</code></pre>
+<h3 id="7-observe-process-state-transitions"><a class="header" href="#7-observe-process-state-transitions">7. Observe process state transitions</a></h3>
+<pre><code class="language-bash">sleep 100 &amp;
+BGPID=$!
+
+ps -p $BGPID -o pid,stat       # S (interruptible sleep)
+
+kill -SIGSTOP $BGPID
+ps -p $BGPID -o pid,stat       # T (stopped)
+
+kill -SIGCONT $BGPID
+ps -p $BGPID -o pid,stat       # S (sleeping again)
+
+kill $BGPID
+</code></pre>
+<h3 id="8-decode-your-shells-signal-masks"><a class="header" href="#8-decode-your-shells-signal-masks">8. Decode your shell's signal masks</a></h3>
+<pre><code class="language-bash">grep Sig /proc/$$/status
+</code></pre>
+<h3 id="9-trace-the-fork-exec-chain-for-any-command"><a class="header" href="#9-trace-the-fork-exec-chain-for-any-command">9. Trace the fork-exec chain for any command</a></h3>
+<pre><code class="language-bash">strace -f -e clone,execve bash -c 'cat /proc/version' 2&gt;&amp;1 | grep -E '(clone|exec)'
+</code></pre>
+<h3 id="10-find-d-state-processes"><a class="header" href="#10-find-d-state-processes">10. Find D-state processes</a></h3>
+<pre><code class="language-bash">ps aux | awk '$8 ~ /^D/'
+# Usually empty; if not, check which device/mount is involved
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together-2"><a class="header" href="#putting-it-all-together-2">Putting It All Together</a></h2>
+<p>The Linux process model is built on one abstraction: everything is a <code>task_struct</code>.</p>
+<pre><code>Everything is a task_struct
+    │
+    ├── Created via clone() (fork = clone with no sharing)
+    │   ├── New task_struct allocated
+    │   ├── Virtual address space duplicated — CoW, no actual copy
+    │   ├── File descriptor table copied
+    │   └── Child placed on run queue; both parent and child are runnable
+    │
+    ├── Program replaced via execve()
+    │   ├── Old address space flushed
+    │   ├── New ELF mapped into memory
+    │   └── PID unchanged — same task_struct, new mm_struct
+    │
+    ├── State tracked in task_struct.__state
+    │   R (runnable) → S (waiting) ↔ D (uninterruptible) → Z (zombie) → reaped
+    │
+    ├── Threads = clone() with CLONE_VM
+    │   ├── Same mm_struct, separate task_struct
+    │   └── Same scheduler, same /proc, different PID — same TGID
+    │
+    └── Exits → zombie → parent calls wait() → reaped
+        If parent dies first → reparented to PID 1 → systemd reaps it
+</code></pre>
+<p>Every shell command follows this path: bash calls <code>fork()</code>, the child sets up redirections, calls <code>execve()</code>, the program runs, exits, and bash reaps it with <code>wait()</code>. Pipes, redirections, job control, and process groups all fall out of this single model — composable primitives with no hidden machinery.</p>
+<hr />
+<h2 id="whats-next-1"><a class="header" href="#whats-next-1">What's Next</a></h2>
+<p>In the next chapter, we go into <strong>memory</strong> in depth. We've touched on virtual memory — VMAs, page tables, copy-on-write — but only as much as the process model required. Chapter 4 traces the full story: how the kernel manages physical memory, what happens on a page fault, how the page cache works, and why <code>free</code> shows almost no "free" memory on a healthy, idle system.</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache"><a class="header" href="#linux-deep-dive-4-memory-management--virtual-memory-and-the-page-cache">Linux Deep Dive #4: Memory Management — Virtual Memory and the Page Cache</a></h1>
-<p><em>Coming soon.</em></p>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>Run <code>free -h</code> on any Linux system that's been running for a while:</p>
+<pre><code>$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        22Gi       200Mi       500Mi       7.8Gi        7.3Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>Most people see the <code>free</code> column — 200 MB — and worry. Only 200 MB of RAM left? But the system is perfectly healthy. <code>available</code> is 7.3 GiB. Something is using 7.8 GiB under <code>buff/cache</code>, and it can be reclaimed on demand.</p>
+<p>This is the kernel doing its job. Idle RAM is wasted RAM. The kernel fills unused memory with file data it might need again, making disk reads fast. When a process needs memory, the kernel reclaims the cache. The <code>free</code> column tells you almost nothing useful. <code>available</code> is the number that matters.</p>
+<p>This chapter explains why — by tracing the full memory architecture from virtual addresses through page tables to physical frames, through the page cache and back. We'll cover how the kernel allocates physical memory, what really happens on a page fault, how the page cache works, and how the kernel reclaims memory under pressure.</p>
+<hr />
+<h2 id="memory-at-a-glance"><a class="header" href="#memory-at-a-glance">Memory at a Glance</a></h2>
+<pre><code>User process (virtual address space)
+    │
+    │  Virtual address → MMU → page table walk
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  4-Level Page Tables                                  │
+│  PGD → PUD → PMD → PTE → physical frame              │
+│  TLB caches recent translations                      │
+└──────────────────────────────────────────────────────┘
+    │
+    │  physical frame number
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  Physical Memory                                      │
+│  ┌────────────────────┐  ┌──────────────────────┐   │
+│  │  Anonymous pages   │  │  File-backed pages   │   │
+│  │  heap, stack, CoW  │  │  (the page cache)    │   │
+│  │  must swap to evict│  │  can drop for free   │   │
+│  └────────────────────┘  └──────────────────────┘   │
+│                                                       │
+│  Buddy allocator manages frames (4KB to 4MB blocks)  │
+│  SLUB allocator carves pages into kernel objects     │
+└──────────────────────────────────────────────────────┘
+    │
+    │  when free memory drops below watermarks
+    ▼
+┌──────────────────────────────────────────────────────┐
+│  Reclaim                                              │
+│  kswapd scans LRU lists                              │
+│  ├── file pages: drop (clean) or writeback + drop    │
+│  └── anon pages: write to swap, then free frame      │
+│                                                       │
+│  Last resort: OOM killer                             │
+└──────────────────────────────────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="virtual-addresses-and-page-tables"><a class="header" href="#virtual-addresses-and-page-tables">Virtual Addresses and Page Tables</a></h2>
+<p>Chapter 3 showed that every process has an <code>mm_struct</code> containing a set of VMAs — contiguous virtual address regions with permissions like <code>r-xp</code> or <code>rw-p</code>. But how does a virtual address in a VMA actually become a physical address the CPU can use?</p>
+<p>The answer is the page table.</p>
+<h3 id="the-4-level-page-table-on-x86-64"><a class="header" href="#the-4-level-page-table-on-x86-64">The 4-Level Page Table on x86-64</a></h3>
+<p>On a 64-bit x86 system, virtual addresses are 48 bits wide. The CPU uses a 4-level page table structure to translate them:</p>
+<pre><code>Virtual address (48-bit):
+  ┌───────┬───────┬───────┬───────┬──────────────┐
+  │  PGD  │  PUD  │  PMD  │  PTE  │ Page offset  │
+  │ 9 bit │ 9 bit │ 9 bit │ 9 bit │   12 bit     │
+  └───────┴───────┴───────┴───────┴──────────────┘
+
+PGD = Page Global Directory   (top-level)
+PUD = Page Upper Directory
+PMD = Page Middle Directory
+PTE = Page Table Entry        (leaf: physical frame number + flags)
+</code></pre>
+<p>The translation works like a 4-level lookup:</p>
+<pre><code>CR3 register → PGD table
+    │  index with bits 47–39
+    ▼
+PGD entry → PUD table
+    │  index with bits 38–30
+    ▼
+PUD entry → PMD table
+    │  index with bits 29–21
+    ▼
+PMD entry → PTE table
+    │  index with bits 20–12
+    ▼
+PTE entry: physical frame number + R/W/X/U flags
+    │  + page offset (bits 11–0)
+    ▼
+Physical address
+</code></pre>
+<p>Each level is a 4KB page holding 512 8-byte entries (9 bits of index → 2^9 = 512). The final 12 bits of the virtual address index into the 4KB page. This gives 48-bit coverage: 9+9+9+9+12 = 48.</p>
+<p>The flags in each PTE are what drive many kernel mechanisms:</p>
+<div class="table-wrapper"><table><thead><tr><th>PTE flag</th><th>Effect</th></tr></thead><tbody>
+<tr><td>Present</td><td>Page is in RAM; if clear, triggers a page fault</td></tr>
+<tr><td>Writable</td><td>Write permission; if clear on a mapped page, triggers CoW fault</td></tr>
+<tr><td>User</td><td>Accessible from user space; kernel-only pages have this clear</td></tr>
+<tr><td>Accessed</td><td>CPU sets this when the page is read (used by reclaim)</td></tr>
+<tr><td>Dirty</td><td>CPU sets this on write (used to detect pages needing writeback)</td></tr>
+<tr><td>NX (No-Execute)</td><td>Prevents execution of data pages</td></tr>
+</tbody></table>
+</div>
+<p>You can see the page table walk in action through <code>/proc/[pid]/pagemap</code>, though that requires root. The more accessible view is <code>/proc/[pid]/maps</code>, which shows the VMAs:</p>
+<pre><code class="language-bash">$ cat /proc/$$/maps | head -8
+5592b7c38000-5592b7c3e000 r--p 00000000 fd:01 530753  /usr/bin/bash
+5592b7c3e000-5592b7c7e000 r-xp 00006000 fd:01 530753  /usr/bin/bash
+5592b7c7e000-5592b7cad000 r--p 00046000 fd:01 530753  /usr/bin/bash
+5592b7cae000-5592b7cb2000 rw-p 00075000 fd:01 530753  /usr/bin/bash
+5592b9040000-5592b90ae000 rw-p 00000000 00:00 0       [heap]
+7f2345a00000-7f2345c00000 r--p 00000000 fd:01 398912  /usr/lib/locale/locale-archive
+...
+7ffe8e3b0000-7ffe8e3d2000 rw-p 00000000 00:00 0       [stack]
+7ffe8e3f8000-7ffe8e3fc000 r--p 00000000 00:00 0       [vvar]
+</code></pre>
+<p>Each row is a VMA. The permissions <code>r-xp</code>, <code>rw-p</code>, <code>r--p</code> map directly to PTE flags. The page table for this process contains entries for each page within each VMA — but only for pages that have actually been touched (page tables are themselves demand-paged).</p>
+<h3 id="the-tlb-caching-page-table-lookups"><a class="header" href="#the-tlb-caching-page-table-lookups">The TLB: Caching Page Table Lookups</a></h3>
+<p>Four memory accesses to translate one address would be crippling. The CPU keeps a <strong>Translation Lookaside Buffer (TLB)</strong> — a small hardware cache of recent virtual→physical translations. A TLB hit returns the physical address in a single cycle. A miss triggers the full 4-level walk.</p>
+<p>TLB misses are part of why context switches have measurable cost: switching processes means switching page tables (loading a new value into <code>CR3</code>), which flushes the TLB. The next few hundred memory accesses in the new process are all TLB misses until the cache warms up.</p>
+<p>The kernel minimizes TLB pressure through <strong>huge pages</strong>: instead of 4KB pages (needing many TLB entries), the kernel can use 2MB pages (PMD-level mappings), covering 512× more memory with a single TLB entry. On this system, transparent huge pages (THP) are in <code>madvise</code> mode — the kernel uses 2MB pages for anonymous memory when the application explicitly requests them:</p>
+<pre><code class="language-bash">$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+</code></pre>
+<hr />
+<h2 id="physical-memory--zones-the-buddy-allocator-and-slab"><a class="header" href="#physical-memory--zones-the-buddy-allocator-and-slab">Physical Memory — Zones, the Buddy Allocator, and Slab</a></h2>
+<h3 id="memory-zones"><a class="header" href="#memory-zones">Memory Zones</a></h3>
+<p>Not all physical RAM is equivalent. Legacy ISA devices could only DMA to the first 16 MB. Older PCI devices can only address below 4 GB. The kernel divides physical memory into <strong>zones</strong> to track these constraints:</p>
+<pre><code class="language-bash">$ cat /proc/buddyinfo
+Node 0, zone      DMA      0      0      0      0      0      0      0      0      1      1      2
+Node 0, zone    DMA32     17     13     13     12      9      9     14     12      9      9    768
+Node 0, zone   Normal  65656  39923  16923   8715   2995    987    367    127     53     27   1876
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Zone</th><th>Physical range</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>DMA</td><td>0–16 MB</td><td>ISA/legacy DMA devices</td></tr>
+<tr><td>DMA32</td><td>0–4 GB</td><td>32-bit PCI devices</td></tr>
+<tr><td>Normal</td><td>&gt; 4 GB</td><td>All other allocations</td></tr>
+</tbody></table>
+</div>
+<p>On this 30 GB machine, the <code>Normal</code> zone holds almost all RAM.</p>
+<h3 id="the-buddy-allocator"><a class="header" href="#the-buddy-allocator">The Buddy Allocator</a></h3>
+<p>The kernel's fundamental physical memory allocator is the <strong>buddy allocator</strong>. It maintains 11 free lists, indexed by order 0 through 10, where order N holds blocks of 2^N contiguous pages:</p>
+<pre><code>Order 0:  1 page   = 4KB
+Order 1:  2 pages  = 8KB
+Order 2:  4 pages  = 16KB
+...
+Order 10: 1024 pages = 4MB
+</code></pre>
+<p>The numbers in <code>buddyinfo</code> are the count of free blocks at each order. In the <code>Normal</code> zone above, there are 65,656 order-0 blocks (4KB each), 39,923 order-1 blocks (8KB each), and so on.</p>
+<p>When the kernel needs N pages:</p>
+<ol>
+<li>Find the smallest order ≥ N with a free block</li>
+<li>If that order is larger than needed, <strong>split</strong> the block: one half goes to the next lower order's free list, the other half is used</li>
+<li>When pages are freed, the kernel checks if the adjacent "buddy" block is also free; if so, they <strong>merge</strong> back to the higher order</li>
+</ol>
+<p>Splitting and merging keep the allocator efficient and minimize fragmentation. You can watch allocation pressure by checking how many high-order blocks remain — if order-10 is empty and order-0 is full, the system is fragmented and can't satisfy large contiguous allocations.</p>
+<pre><code class="language-bash"># Watch buddy allocator state live
+watch -d cat /proc/buddyinfo
+</code></pre>
+<h3 id="the-slub-allocator"><a class="header" href="#the-slub-allocator">The SLUB Allocator</a></h3>
+<p>The buddy allocator deals in full pages. But the kernel constantly allocates objects much smaller than 4KB: <code>task_struct</code> (~7KB but padded), <code>file</code> (~300 bytes), <code>dentry</code> (~200 bytes), <code>inode</code> (~600 bytes), socket buffers (~200 bytes each). Handing out a full 4KB page for each would waste enormous amounts of RAM.</p>
+<p>The <strong>SLUB allocator</strong> (Simplified Unqueued Layer) sits on top of the buddy allocator. It maintains per-CPU <strong>slabs</strong> — pages filled with pre-allocated objects of a single size. Allocating a small kernel object takes a free slot from a slab; freeing it returns the slot. No buddyallocator call needed.</p>
+<pre><code class="language-bash"># See the largest slab caches by memory usage
+$ sudo slabtop -o | head -15
+ Active / Total Objects (% used)    : 2344037 / 2429115 (96.5%)
+ Active / Total Slabs (% used)      : 82684 / 82684 (100.0%)
+ Active / Total Caches (% used)     : 193 / 244 (79.1%)
+ Active / Total Size (% used)       : 622408.38K / 655006.31K (95.0%)
+
+  OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME
+253056 253056 100%    0.19K   6016       42     24064K dentry
+198400 186988  94%    0.06K   3100       64      6200K kmalloc-64
+110916  95897  86%    1.06K   9243       12    147888K inode_cache
+ 37248  37248 100%    0.50K   1164       32     18624K kmalloc-512
+</code></pre>
+<p><code>dentry</code> (directory entry cache) and <code>inode_cache</code> are typically the largest slab consumers — the kernel caches filesystem metadata aggressively because lookups are frequent and disk access is slow.</p>
+<hr />
+<h2 id="page-faults"><a class="header" href="#page-faults">Page Faults</a></h2>
+<p>When the CPU walks the page table and something is wrong, it raises a <strong>page fault</strong> — a hardware exception that transfers control to the kernel's fault handler (<code>handle_mm_fault()</code> in <code>mm/memory.c</code>). There are several distinct kinds:</p>
+<div class="table-wrapper"><table><thead><tr><th>Fault type</th><th>Cause</th><th>Kernel action</th><th>Disk I/O?</th></tr></thead><tbody>
+<tr><td><strong>Minor</strong></td><td>Page in VMA but PTE not present (first access)</td><td>Allocate frame, fill PTE</td><td>No</td></tr>
+<tr><td><strong>Major</strong></td><td>Page was evicted to disk; PTE marked not-present</td><td>Read page from disk, fill PTE</td><td>Yes</td></tr>
+<tr><td><strong>CoW</strong></td><td>Write to a read-only shared page (after fork)</td><td>Copy page, update PTE to writable</td><td>No</td></tr>
+<tr><td><strong>Invalid</strong></td><td>Access outside any VMA</td><td>Deliver SIGSEGV</td><td>No</td></tr>
+</tbody></table>
+</div>
+<p>Minor faults are normal and constant — they happen every time a program accesses a new page of its heap or stack. The kernel allocates a physical frame, zeros it (to prevent information leaks), updates the PTE, and the program continues. No disk I/O, just a brief detour through the kernel.</p>
+<p>Major faults are a symptom of memory pressure. They mean the kernel previously evicted this page to disk to free RAM, and now the program needs it back. Major faults cause visible latency — the application stalls waiting for the disk read to complete.</p>
+<pre><code class="language-bash"># Page fault totals since boot
+$ grep -E '^pgfault|^pgmajfault' /proc/vmstat
+pgfault       39670010   # minor faults — normal, healthy
+pgmajfault        3007   # major faults — disk reads to recover evicted pages
+</code></pre>
+<p>39 million minor faults since boot is expected. 3007 major faults is low — this system hasn't been under enough memory pressure to evict much. On a memory-constrained system, <code>pgmajfault</code> climbs steadily and latency spikes whenever a major fault stalls a thread.</p>
+<p>The CoW fault is the mechanism from Chapter 3: after <code>fork()</code>, parent and child share physical pages marked read-only. The first write from either side triggers a fault, the kernel copies the page, and both now have their own writable copy.</p>
+<p>You can measure per-process fault rates in real time:</p>
+<pre><code class="language-bash"># Fault rates for a running process
+$ cat /proc/1/status | grep -i fault
+voluntary_ctxt_switches: 31248
+nonvoluntary_ctxt_switches: 1156
+
+# For cumulative fault count, smaps_rollup is faster than summing smaps:
+$ sudo cat /proc/1/smaps_rollup | grep -E 'Rss|Pss'
+Rss:               21432 kB
+Pss:               13891 kB
+</code></pre>
+<hr />
+<h2 id="the-page-cache"><a class="header" href="#the-page-cache">The Page Cache</a></h2>
+<p>This is the mechanism behind the <code>buff/cache</code> column in <code>free</code>. It's also the single most important thing to understand about Linux memory management.</p>
+<h3 id="the-basic-idea"><a class="header" href="#the-basic-idea">The Basic Idea</a></h3>
+<p>When you <code>read()</code> from a file, the kernel doesn't transfer bytes directly from disk to your process. It maintains a <strong>page cache</strong> — a pool of physical pages indexed by <code>(filesystem inode, page offset)</code>. The read path is:</p>
+<pre><code>read() syscall
+    │
+    ├── Is (inode, offset) already in the page cache?
+    │   ├── Yes: copy from cache to user buffer → done (no disk I/O)
+    │   └── No:  read from disk into a new cache page,
+    │             then copy to user buffer
+    │
+    └── Cache page stays in RAM after the read
+</code></pre>
+<p>The page cache entry persists after your <code>read()</code> returns. The <em>next</em> <code>read()</code> of the same region — whether by you, another process, or another program — finds it in cache and pays no disk cost.</p>
+<p>This is why a fresh <code>make</code> that compiles 10,000 source files goes faster on the second run: all those file reads hit the cache. The first run was I/O-bound; the second is CPU-bound.</p>
+<h3 id="file-backed-vs-anonymous-memory"><a class="header" href="#file-backed-vs-anonymous-memory">File-Backed vs Anonymous Memory</a></h3>
+<p>Physical memory pages fall into two categories:</p>
+<pre><code>Physical pages
+    │
+    ├── File-backed (page cache)
+    │   ├── Clean: identical to disk → kernel can drop for free
+    │   └── Dirty: modified, not yet written back
+    │           → kernel must flush to disk before dropping
+    │
+    └── Anonymous (no file)
+        ├── Heap, stack, CoW copies, anonymous mmap
+        └── To free: must write to swap device first
+                      (or kill the process)
+</code></pre>
+<p>File-backed pages are cheap to evict — the kernel just drops the page and re-reads it from disk if needed again. Anonymous pages are expensive: they have no file backing, so eviction requires writing to swap and reading back later.</p>
+<p>This distinction drives the entire reclaim strategy.</p>
+<h3 id="mmap-and-the-page-cache"><a class="header" href="#mmap-and-the-page-cache">mmap() and the Page Cache</a></h3>
+<p><code>mmap()</code> is the page cache seen from the process side. When your program opens a file and calls:</p>
+<pre><code class="language-c">void *ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+</code></pre>
+<p>The kernel creates a VMA that represents a window into the file's pages in the page cache. No data is loaded yet. When you dereference <code>ptr</code>, a minor page fault fires; the kernel checks the page cache (reading from disk if necessary), and installs a PTE pointing to that cache page. <strong>The process's PTE and the page cache entry point to the same physical frame.</strong></p>
+<p>This has an important consequence: every process running the same program shares its text segment.</p>
+<pre><code class="language-bash"># How many processes share bash's text pages?
+$ cat /proc/$(pgrep -n bash)/smaps | grep -A 10 'bash$' | head -12
+5592b7c3e000-5592b7c7e000 r-xp 00006000 fd:01 530753  /usr/bin/bash
+Size:                256 kB
+KernelPageSize:        4 kB
+Rss:                 252 kB
+Pss:                  14 kB    ← proportional share — 252KB / ~18 processes
+Shared_Clean:        252 kB    ← all of it is shared
+Private_Clean:         0 kB
+</code></pre>
+<p><code>Rss</code> (Resident Set Size) is the total physical memory mapped. <code>Pss</code> (Proportional Set Size) divides shared pages by the number of processes sharing them. The <code>r-xp</code> text segment shows <code>Shared_Clean: 252 kB</code> and <code>Pss: 14 kB</code> — 18 bash processes share the same physical pages. One copy in RAM, many processes using it.</p>
+<h3 id="reading-the-page-cache-statistics"><a class="header" href="#reading-the-page-cache-statistics">Reading the Page Cache Statistics</a></h3>
+<pre><code class="language-bash">$ grep -E '^(Cached|Buffers|Mapped|Dirty|Writeback)' /proc/meminfo
+Buffers:            4208 kB
+Cached:          6564188 kB
+Mapped:          1189268 kB
+Dirty:              1336 kB
+Writeback:             0 kB
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Cached</code></td><td>Total page cache size</td></tr>
+<tr><td><code>Buffers</code></td><td>Block device metadata cache (separate from file data cache)</td></tr>
+<tr><td><code>Mapped</code></td><td>Page cache pages currently mapped into at least one process's address space</td></tr>
+<tr><td><code>Dirty</code></td><td>Modified pages not yet written to disk</td></tr>
+<tr><td><code>Writeback</code></td><td>Pages currently being written to disk</td></tr>
+</tbody></table>
+</div>
+<p>On this machine, <code>Cached</code> is 6.4 GB — 6.4 GB of file data sitting in RAM, ready for instant re-use. <code>Dirty</code> is only 1.3 MB, meaning the kernel's writeback threads are keeping up with writes. <code>Writeback</code> is 0, so no I/O is in flight right now.</p>
+<hr />
+<h2 id="reclaim--how-the-kernel-manages-memory-pressure"><a class="header" href="#reclaim--how-the-kernel-manages-memory-pressure">Reclaim — How the Kernel Manages Memory Pressure</a></h2>
+<h3 id="lru-lists"><a class="header" href="#lru-lists">LRU Lists</a></h3>
+<p>The kernel tracks which pages are worth keeping with four LRU (Least Recently Used) lists:</p>
+<pre><code>LRU lists
+    ├── active_file    — recently used file-backed pages
+    ├── inactive_file  — older file-backed pages (reclaim candidates)
+    ├── active_anon    — recently used anonymous pages
+    └── inactive_anon  — older anonymous pages (swap candidates)
+</code></pre>
+<p>Pages move between these lists based on access patterns. The hardware <strong>Accessed</strong> bit in PTEs tells the kernel when a page was last used. Pages migrate from active to inactive when they haven't been accessed for a while; from inactive, they become reclaim candidates.</p>
+<pre><code class="language-bash">$ grep -E '^(Active|Inactive)' /proc/meminfo
+Active:          7844660 kB
+Inactive:        4958656 kB
+Active(anon):    4685204 kB
+Inactive(anon):        0 kB
+Active(file):    3159456 kB
+Inactive(file):  4958656 kB
+</code></pre>
+<p>On this system: 4.7 GB of anonymous memory is active (process heaps/stacks in use), 3.2 GB of file cache is active (recently read files). The 4.9 GB of inactive file cache is the first thing kswapd will drop if memory gets tight.</p>
+<h3 id="kswapd-and-watermarks"><a class="header" href="#kswapd-and-watermarks">kswapd and Watermarks</a></h3>
+<p><strong>kswapd</strong> is a kernel thread that maintains free memory within a healthy range. The kernel defines three watermarks for each zone:</p>
+<pre><code>Zone free pages
+    │
+    ├── High watermark — kswapd stops here (plenty of free memory)
+    │
+    ├── Low watermark  — kswapd wakes up and starts reclaiming
+    │
+    └── Min watermark  — direct reclaim kicks in; allocations stall
+                         until kswapd frees enough pages
+</code></pre>
+<p>When free memory drops below the low watermark, kswapd wakes and scans the inactive lists:</p>
+<ol>
+<li><strong>Inactive file pages</strong> (clean): drop immediately — they're exact copies of disk data</li>
+<li><strong>Inactive file pages</strong> (dirty): schedule writeback, then drop after write completes</li>
+<li><strong>Inactive anon pages</strong>: write to swap device, then free the frame</li>
+</ol>
+<pre><code class="language-bash"># Is kswapd doing any work?
+$ grep -E 'pgsteal_kswapd|pgscan_kswapd|kswapd_low_wmark' /proc/vmstat
+pgsteal_kswapd             0    # pages reclaimed by kswapd (0 = no pressure)
+pgscan_kswapd              0    # pages scanned during reclaim
+kswapd_low_wmark_hit_quickly   0
+</code></pre>
+<p>All zeros: this system is not under memory pressure. kswapd is idle. On a memory-constrained system, <code>pgsteal_kswapd</code> climbs continuously.</p>
+<h3 id="swappiness"><a class="header" href="#swappiness">Swappiness</a></h3>
+<p>The <code>vm.swappiness</code> sysctl (0–200, default 60) controls the balance between evicting file cache and swapping anonymous pages. It's a weight in the reclaim cost calculation — higher values make the kernel more willing to swap anonymous pages alongside evicting file cache.</p>
+<pre><code class="language-bash">$ cat /proc/sys/vm/swappiness
+60
+</code></pre>
+<p>Contrary to common belief, swappiness is not a memory-use threshold. <code>swappiness=60</code> does not mean "start swapping at 60% memory use." It means: when choosing between evicting a file page and swapping an anonymous page, weight the decision so that both are considered in roughly a 60:100 ratio.</p>
+<p>Setting <code>swappiness=1</code> makes the kernel almost never swap — it will exhaust file cache before touching anonymous memory. Setting it to <code>200</code> makes the kernel aggressively swap, preferring to keep file cache hot. Neither extreme is universally right.</p>
+<pre><code class="language-bash"># Check swap usage
+$ grep -E '^(SwapTotal|SwapFree|SwapCached|Pswpin|Pswpout)' /proc/meminfo
+SwapTotal:       8388604 kB
+SwapFree:        8388604 kB
+SwapCached:            0 kB
+
+# Swap activity since boot
+$ grep -E '^pswp' /proc/vmstat
+pswpin    0     # pages swapped in (major faults from swap)
+pswpout   0     # pages swapped out
+</code></pre>
+<p>Zero swap activity on this machine — there's enough RAM that kswapd hasn't needed to swap anything out.</p>
+<hr />
+<h2 id="the-oom-killer"><a class="header" href="#the-oom-killer">The OOM Killer</a></h2>
+<p>When free memory hits zero, all reclaim options are exhausted, and a memory allocation is still failing, the kernel invokes the <strong>OOM killer</strong> (Out Of Memory killer) as a last resort.</p>
+<p>The OOM killer selects a process to terminate based on <code>oom_score</code> — a value from 0 to 1000 calculated from:</p>
+<ul>
+<li>RSS (how much RAM the process is actually using)</li>
+<li>Runtime (longer-running processes are slightly protected)</li>
+<li>Nice value (low-priority processes score higher)</li>
+<li>Whether the process is privileged (root processes score slightly lower)</li>
+</ul>
+<p>The process with the highest score gets killed with SIGKILL.</p>
+<pre><code class="language-bash"># OOM score for each running process
+$ cat /proc/1/oom_score          # systemd — should be 0 (protected)
+0
+
+$ cat /proc/$$/oom_score         # your shell
+5
+
+# Processes can adjust their score (-1000 to +1000)
+$ cat /proc/$$/oom_score_adj
+0
+</code></pre>
+<p>Setting <code>oom_score_adj</code> to <code>-1000</code> makes a process immune to OOM killing. Systemd sets itself to -1000 for exactly this reason. Critical system daemons often do the same. Setting it to <code>+1000</code> means "kill me first in an OOM."</p>
+<pre><code class="language-bash"># Which process would the OOM killer target right now?
+$ ps -eo pid,oom_score,rss,comm --sort=-oom_score | head -10
+    PID OOM_SCORE    RSS COMMAND
+   2847       182 2345200 firefox
+   3012        89  854320 slack
+   3201        45  412800 gnome-shell
+</code></pre>
+<p>The OOM killer fires rarely on a well-sized system. If it fires often, the right fix is more RAM, fixing a memory leak, or adding limits with memory cgroups — not tuning OOM parameters.</p>
+<hr />
+<h2 id="why-free-shows-almost-no-free-memory"><a class="header" href="#why-free-shows-almost-no-free-memory">Why <code>free</code> Shows Almost No "Free" Memory</a></h2>
+<p>Now we have all the pieces. Return to the output from a memory-loaded system:</p>
+<pre><code>$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        22Gi       200Mi       500Mi       7.8Gi        7.3Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>What does each column actually mean?</p>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>What it counts</th></tr></thead><tbody>
+<tr><td><code>total</code></td><td>Total physical RAM</td></tr>
+<tr><td><code>used</code></td><td>Process memory + kernel memory not reclaimable</td></tr>
+<tr><td><code>free</code></td><td>Completely idle frames — holding nothing</td></tr>
+<tr><td><code>shared</code></td><td>tmpfs and shared memory</td></tr>
+<tr><td><code>buff/cache</code></td><td>Page cache + buffer cache — <strong>reclaimable on demand</strong></td></tr>
+<tr><td><code>available</code></td><td>Estimated memory a new allocation could get ≈ free + reclaimable buff/cache</td></tr>
+</tbody></table>
+</div>
+<p>The <code>free</code> column being 200 MB does not mean the system is nearly out of memory. It means the kernel has filled almost all idle frames with page cache — which it should. Those 7.8 GB of <code>buff/cache</code> are serving file reads instantly.</p>
+<p>When a process needs more memory, the kernel reclaims from <code>buff/cache</code> first (by dropping clean file pages). The new allocation succeeds, and <code>buff/cache</code> shrinks. <code>available</code> — not <code>free</code> — is what tells you whether a large new allocation will succeed.</p>
+<p>The actual machine for this series has 30 GB of RAM and was not heavily loaded at the time this chapter was written:</p>
+<pre><code class="language-bash">$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:            30Gi        11Gi        12Gi       153Mi       6.6Gi        19Gi
+Swap:          8.0Gi          0B       8.0Gi
+</code></pre>
+<p>Here <code>free</code> is 12 GB — plenty. But the pattern is the same: <code>buff/cache</code> is 6.6 GB of page cache that the kernel built up from disk reads. It's not waste. It's usable memory being put to work.</p>
+<p>The rule: <strong>the system is healthy as long as <code>available</code> is above zero and <code>Swap:used</code> is not climbing rapidly.</strong></p>
+<pre><code class="language-bash"># One-liner to check memory health
+$ free -h &amp;&amp; grep -E '^(SwapFree|Dirty|Writeback)' /proc/meminfo
+</code></pre>
+<hr />
+<h2 id="try-it-yourself-3"><a class="header" href="#try-it-yourself-3">Try It Yourself</a></h2>
+<h3 id="1-the-big-picture"><a class="header" href="#1-the-big-picture">1. The big picture</a></h3>
+<pre><code class="language-bash">free -h
+cat /proc/meminfo
+</code></pre>
+<h3 id="2-where-is-memory-going-by-process"><a class="header" href="#2-where-is-memory-going-by-process">2. Where is memory going, by process?</a></h3>
+<pre><code class="language-bash"># Sort by RSS (resident, actual physical pages)
+ps -eo pid,rss,vsz,comm --sort=-rss | head -15
+
+# VSZ is virtual size (mapped but not necessarily in RAM)
+# RSS is what's actually resident in physical memory
+</code></pre>
+<h3 id="3-per-vma-detail-for-a-process"><a class="header" href="#3-per-vma-detail-for-a-process">3. Per-VMA detail for a process</a></h3>
+<pre><code class="language-bash"># smaps shows Rss, Pss (proportional), and sharing info per mapping
+cat /proc/$$/smaps | grep -E '^(Size|Rss|Pss|Shared_Clean|Private)' | head -30
+</code></pre>
+<h3 id="4-proportional-memory-use-across-the-system"><a class="header" href="#4-proportional-memory-use-across-the-system">4. Proportional memory use across the system</a></h3>
+<pre><code class="language-bash"># PSS (Proportional Set Size) divides shared pages fairly between sharers
+sudo cat /proc/*/smaps_rollup 2&gt;/dev/null | grep ^Pss | awk '{s+=$2} END {print s/1024 "MB total PSS"}'
+</code></pre>
+<h3 id="5-the-buddy-allocators-free-list"><a class="header" href="#5-the-buddy-allocators-free-list">5. The buddy allocator's free list</a></h3>
+<pre><code class="language-bash"># Higher-order blocks = less fragmentation = better large allocations
+cat /proc/buddyinfo
+</code></pre>
+<h3 id="6-slab-allocator-caches"><a class="header" href="#6-slab-allocator-caches">6. Slab allocator caches</a></h3>
+<pre><code class="language-bash">sudo slabtop -o | head -20
+# OBJ SIZE × SLABS × OBJ/SLAB = total memory used by each cache
+</code></pre>
+<h3 id="7-page-fault-counts-since-boot"><a class="header" href="#7-page-fault-counts-since-boot">7. Page fault counts since boot</a></h3>
+<pre><code class="language-bash">grep -E '^pgfault|^pgmajfault' /proc/vmstat
+# pgmajfault counts disk reads due to evicted pages — low is good
+</code></pre>
+<h3 id="8-is-kswapd-doing-any-work"><a class="header" href="#8-is-kswapd-doing-any-work">8. Is kswapd doing any work?</a></h3>
+<pre><code class="language-bash">grep -E 'pgsteal_kswapd|pgscan_kswapd|pswp' /proc/vmstat
+# Non-zero pgsteal_kswapd means active reclaim — system is under memory pressure
+</code></pre>
+<h3 id="9-drop-the-page-cache-and-watch-free-change"><a class="header" href="#9-drop-the-page-cache-and-watch-free-change">9. Drop the page cache and watch <code>free</code> change</a></h3>
+<pre><code class="language-bash"># Sync first to avoid dropping dirty data
+sync
+
+# Drop page cache, dentries, and inodes (3 = all)
+# This is SAFE — it's read-only metadata and clean file data
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# free will jump; buff/cache will drop
+free -h
+
+# The cache refills automatically as you read files
+</code></pre>
+<h3 id="10-oom-scores-across-the-system"><a class="header" href="#10-oom-scores-across-the-system">10. OOM scores across the system</a></h3>
+<pre><code class="language-bash"># Which process would the OOM killer target?
+ps -eo pid,oom_score,rss,comm --sort=-oom_score | head -10
+
+# Check if any process is protecting itself from OOM
+grep -r -l '\-1000' /proc/*/oom_score_adj 2&gt;/dev/null | head -5
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together-3"><a class="header" href="#putting-it-all-together-3">Putting It All Together</a></h2>
+<pre><code>Process writes to a new heap page
+    │
+    │  CPU walks page table → PTE not present
+    ▼
+Minor page fault
+    │  kernel allocates a physical frame (buddy allocator: order-0)
+    │  SLUB if kernel object; direct page if user allocation
+    │  zeroes the frame (security: no previous content leaks)
+    │  installs PTE: virtual page → physical frame, writable
+    │
+    ▼ frame is now in memory, process continues
+
+Process reads a file it hasn't opened before
+    │
+    │  read() → VFS → page cache lookup → miss
+    ▼
+Major page fault (or synchronous read)
+    │  block I/O reads the file's page from disk
+    │  page lands in page cache (indexed by inode + offset)
+    │  PTE installed (for mmap) or data copied to user buffer (for read())
+    │
+    ▼ page cache entry persists
+
+File page stays in page cache
+    │
+    ├── accessed again → serves from RAM, no disk I/O
+    │
+    └── memory pressure → kswapd
+        │
+        ├── page is clean → drop for free
+        │   (re-read from disk if accessed again → major fault)
+        │
+        └── page is dirty → writeback, then drop
+
+Anonymous page under pressure
+    │
+    └── kswapd writes to swap device
+        │  frame is freed
+        │  PTE updated: page-not-present (swap offset stored elsewhere)
+        │
+        └── process accesses the page again
+            │  major fault: read from swap → restore frame → PTE updated
+            ▼  slow, but correct
+
+Memory completely exhausted
+    │
+    └── OOM killer: select highest oom_score process → SIGKILL
+        frame freed, pressure relieved
+</code></pre>
+<p>The page cache is the unifying thread: <code>read()</code>, <code>write()</code>, <code>mmap()</code>, executable loading, and library sharing all flow through it. The kernel's job is to keep the working set of your running processes in RAM while using the rest for cache — and to reclaim that cache quietly, before you notice, whenever someone needs more memory.</p>
+<hr />
+<h2 id="whats-next-2"><a class="header" href="#whats-next-2">What's Next</a></h2>
+<p>In Chapter 5, we'll look at the <strong>scheduler</strong> — how the kernel decides which of many runnable processes gets CPU time. We've already seen <code>task_struct</code> and its <code>se.vruntime</code> field (CFS virtual runtime). Chapter 5 fills that in: what CFS virtual runtime means, how nice values translate to actual CPU share, what <code>load average</code> really measures, and how to diagnose scheduler-related latency.</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs"><a class="header" href="#linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs">Linux Deep Dive #5: The Scheduler — How the Kernel Decides What Runs</a></h1>
-<p><em>Coming soon.</em></p>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>Right now, <code>/proc/loadavg</code> on this machine shows:</p>
+<pre><code>0.24 0.38 0.37 2/1951 75458
+</code></pre>
+<p>The <code>2/1951</code> means 2 processes are running at this exact moment out of 1,951 that exist. The system has 12 CPUs, so it could run 12 simultaneously — but only 2 have something to do right now. The rest are waiting.</p>
+<p>That "waiting" is almost never passive. Processes sleep voluntarily (waiting for I/O, a timer, a lock), then wake up demanding CPU time. Thousands of times per second, the kernel must answer the same question: out of everyone who wants to run right now, who goes next?</p>
+<p>That decision belongs to the scheduler.</p>
+<hr />
+<h2 id="the-big-picture"><a class="header" href="#the-big-picture">The Big Picture</a></h2>
+<p>The Linux scheduler is not a single algorithm. It's a layered system with multiple scheduling classes, each handling different process types. At the top level:</p>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                    Scheduling Classes                    │
+│  (highest priority checked first, runs if runnable)      │
+│                                                          │
+│  SCHED_DEADLINE  ← real-time: explicit deadline/period  │
+│  SCHED_FIFO      ← real-time: first in, never preempted │
+│  SCHED_RR        ← real-time: round-robin with slice    │
+│  SCHED_NORMAL    ← normal processes (you, bash, chrome) │
+│  SCHED_BATCH     ← CPU-bound background work            │
+│  SCHED_IDLE      ← lower than nice +19                  │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Real-time classes (<code>DEADLINE</code>, <code>FIFO</code>, <code>RR</code>) always preempt normal processes. Within the normal class, the scheduler runs <strong>EEVDF</strong> — Earliest Eligible Virtual Deadline First — the algorithm that replaced CFS in Linux 6.6.</p>
+<hr />
+<h2 id="from-cfs-to-eevdf"><a class="header" href="#from-cfs-to-eevdf">From CFS to EEVDF</a></h2>
+<p>To understand EEVDF, you need to understand what it replaced and why.</p>
+<h3 id="the-cfs-mental-model"><a class="header" href="#the-cfs-mental-model">The CFS mental model</a></h3>
+<p><strong>CFS (Completely Fair Scheduler)</strong>, introduced in Linux 2.6.23, was built around one idea: every process should get exactly its fair share of CPU time. Not just approximately — exactly. CFS tracks this precisely.</p>
+<p>The mechanism: each process has a <strong>vruntime</strong> (virtual runtime) counter, measured in nanoseconds. Every nanosecond a process runs, its vruntime increases. But the rate of increase depends on the process's priority — a high-priority process's vruntime grows more slowly, so it gets selected to run more often.</p>
+<p>CFS stored all runnable processes in a <strong>red-black tree</strong> keyed by vruntime. The scheduler always picked the process with the smallest vruntime — the one that has received the least CPU time. After running for one time slice, its vruntime increased, and it was reinserted at its new position. Whoever now had the smallest vruntime ran next.</p>
+<p>This made the scheduler O(log n) for most operations (red-black tree insertion/lookup), with the property that no process ever accumulated more than one time slice of "debt" relative to any other.</p>
+<h3 id="the-eevdf-refinement"><a class="header" href="#the-eevdf-refinement">The EEVDF refinement</a></h3>
+<p>CFS had a problem: it picked the "most deserving" process but had no concept of <em>when</em> that process needed to run. A low-latency audio thread and a CPU-hungry compiler could have the same vruntime, but they have wildly different timing requirements.</p>
+<p><strong>EEVDF</strong> (Earliest Eligible Virtual Deadline First, landed in Linux 6.6) adds an explicit <strong>virtual deadline</strong> alongside vruntime. Each process gets a time slice — a requested service quantum. Its virtual deadline is computed as:</p>
+<pre><code>virtual_deadline = vruntime + time_slice / weight
+</code></pre>
+<p>The scheduler picks the runnable process whose virtual deadline is earliest — not just the one with the smallest vruntime. This gives the scheduler a way to prefer short-running, latency-sensitive tasks over long-running ones even when they have similar accumulated CPU time.</p>
+<h3 id="what-you-can-see"><a class="header" href="#what-you-can-see">What you can see</a></h3>
+<p>On this machine (kernel 6.19.11), every <code>SCHED_NORMAL</code> process has an explicit time slice of <strong>2.8 ms</strong>:</p>
+<pre><code class="language-bash">$ chrt -p $$
+pid 75352's current scheduling policy: SCHED_OTHER
+pid 75352's current scheduling priority: 0
+pid 75352's current runtime parameter: 2800000
+</code></pre>
+<p>That <code>2800000</code> is nanoseconds — 2.8 ms. That's the EEVDF slice. CFS had no such fixed slice; it calculated a "target latency" divided by the number of runnable processes. EEVDF makes it explicit.</p>
+<p>You can see each process's vruntime directly:</p>
+<pre><code class="language-bash">$ cat /proc/$$/sched | head -10
+bash (75352, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :      47483595.680258
+se.vruntime                                  :     102684.252917
+se.sum_exec_runtime                          :          5.248837
+se.nr_migrations                             :                 0
+nr_switches                                  :                62
+nr_voluntary_switches                        :                26
+nr_involuntary_switches                      :                 0
+se.load.weight                               :           1048576
+</code></pre>
+<p>Key fields:</p>
+<ul>
+<li><code>se.vruntime</code> — 102,684 ms accumulated virtual time. This is the scheduler's currency.</li>
+<li><code>se.sum_exec_runtime</code> — only 5.2 ms of actual CPU time. This process barely runs.</li>
+<li><code>nr_voluntary_switches</code> — 26 times this process gave up the CPU willingly (waiting for I/O or input).</li>
+<li><code>nr_involuntary_switches</code> — 0. The scheduler never had to yank the CPU away from it. It always yielded on its own.</li>
+</ul>
+<p>Compare that to a busier process, systemd (PID 1):</p>
+<pre><code class="language-bash">$ cat /proc/1/sched | head -10
+systemd (1, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :      47483479.684417
+se.vruntime                                  :        106.342126
+se.sum_exec_runtime                          :       2724.968813
+nr_switches                                  :              11033
+nr_voluntary_switches                        :              10422
+nr_involuntary_switches                      :                611
+se.load.weight                               :           1048576
+</code></pre>
+<p>systemd has <code>nr_involuntary_switches: 611</code> — 611 times the scheduler decided "time's up" and switched to someone else. That's normal for a long-running process handling many short requests.</p>
+<hr />
+<h2 id="nice-values-and-weights"><a class="header" href="#nice-values-and-weights">Nice Values and Weights</a></h2>
+<p>Not all SCHED_NORMAL processes are equal. The <strong>nice value</strong> controls how fast a process's vruntime accumulates — and therefore how much CPU time it gets.</p>
+<p>Nice values range from <strong>-20</strong> (highest priority) to <strong>+19</strong> (lowest). Default is 0. The name comes from "being nice" to other processes: a process with a high nice value voluntarily gives up CPU time.</p>
+<p>The kernel converts nice values to <strong>weights</strong> using a fixed table where each step is approximately 1.25×:</p>
+<div class="table-wrapper"><table><thead><tr><th>Nice</th><th>Weight</th><th>Relative to nice-0</th></tr></thead><tbody>
+<tr><td>-20</td><td>88761</td><td>~86× more</td></tr>
+<tr><td>-10</td><td>9548</td><td>~9.3×</td></tr>
+<tr><td>-5</td><td>3121</td><td>~3.1×</td></tr>
+<tr><td>0</td><td>1024</td><td>baseline</td></tr>
+<tr><td>+5</td><td>335</td><td>~0.33×</td></tr>
+<tr><td>+10</td><td>110</td><td>~0.11×</td></tr>
+<tr><td>+19</td><td>15</td><td>~68× less</td></tr>
+</tbody></table>
+</div>
+<p>The vruntime delta per nanosecond of real time is:</p>
+<pre><code>delta_vruntime = delta_exec × (1024 / weight)
+</code></pre>
+<p>A nice -20 process (weight 88761) accumulates vruntime 86× <em>slower</em> than a nice 0 process. Since the scheduler picks based on earliest deadline (derived from vruntime), the nice -20 process runs 86× more often. A nice +19 process (weight 15) accumulates vruntime 68× <em>faster</em> — it falls behind quickly and runs rarely.</p>
+<p>You can see nice values live on this machine:</p>
+<pre><code class="language-bash">$ ps -eo pid,ni,comm --sort=ni | head -5
+    PID  NI COMMAND
+      9 -20 rcu_tasks_kthread
+     11 -20 rcu_tasks_rude_
+     12 -20 rcu_tasks_trace
+   5297 -11 pipewire
+</code></pre>
+<p>PipeWire (the audio server) runs at nice -11. That's why audio doesn't stutter when the CPU is loaded. The kernel scheduler ensures it gets CPU time well ahead of normal-priority processes.</p>
+<pre><code class="language-bash">$ ps -eo pid,ni,comm --sort=-ni | head -3
+    PID  NI COMMAND
+ 136282 +19 khugepaged
+  75352   0 bash
+</code></pre>
+<p><code>khugepaged</code> — the background thread that collapses small pages into huge pages — runs at nice +19. It gets CPU time only when nothing else wants it. Perfect for a background maintenance task.</p>
+<p>You can change nice values:</p>
+<pre><code class="language-bash"># Start a process at nice +10
+nice -n 10 make -j12
+
+# Change a running process's nice value (requires root to go more negative)
+renice -n 5 -p &lt;pid&gt;
+</code></pre>
+<hr />
+<h2 id="scheduling-classes-in-detail"><a class="header" href="#scheduling-classes-in-detail">Scheduling Classes in Detail</a></h2>
+<p>When the scheduler runs, it checks each class from highest to lowest priority. If a real-time process is runnable, it runs — the normal class doesn't get a look in.</p>
+<h3 id="sched_deadline"><a class="header" href="#sched_deadline">SCHED_DEADLINE</a></h3>
+<p>The highest priority class. A process declares its needs explicitly:</p>
+<pre><code>period=100ms, runtime=10ms, deadline=50ms
+</code></pre>
+<p>"Every 100ms, give me 10ms of CPU time, and deliver it within 50ms of each period's start."</p>
+<p>The kernel enforces this using <strong>CBS (Constant Bandwidth Server)</strong> — it tracks how much runtime each deadline task has consumed and throttles it if it overruns. Admission control rejects new DEADLINE tasks if they'd make the system unschedulable.</p>
+<p>Real-time audio, video capture, and industrial control systems use this. On this machine, the RT bandwidth pool is configured conservatively:</p>
+<pre><code class="language-bash">$ cat /proc/sys/kernel/sched_rt_period_us
+1000000
+$ cat /proc/sys/kernel/sched_rt_runtime_us
+950000
+</code></pre>
+<p>RT tasks (FIFO, RR, DEADLINE combined) can use at most 95% of each 1-second period. The remaining 5% is reserved for normal processes — a safety valve to prevent a runaway RT process from completely starving the system.</p>
+<h3 id="sched_fifo-and-sched_rr"><a class="header" href="#sched_fifo-and-sched_rr">SCHED_FIFO and SCHED_RR</a></h3>
+<p>Classic POSIX real-time policies. Both run at a fixed priority (1–99, higher is better):</p>
+<ul>
+<li><strong>FIFO</strong>: Runs until it blocks or explicitly yields. No time slicing. Preempts any lower-priority process immediately.</li>
+<li><strong>RR</strong> (Round Robin): Like FIFO, but with a time slice. After the slice expires, it moves to the back of its priority queue. Same priority means round-robin; higher priority always wins.</li>
+</ul>
+<p>The kernel threads that migrate processes between CPUs use FIFO:</p>
+<pre><code class="language-bash">$ ps -eo pid,cls,rtprio,comm | grep migration | head -4
+   30 FF      99 migration/0
+   37 FF      99 migration/1
+   44 FF      99 migration/2
+   51 FF      99 migration/3
+</code></pre>
+<p><code>FF</code> = FIFO, rtprio 99 — the highest possible RT priority. These threads must run instantly when a CPU balance decision is made; nothing should ever preempt them.</p>
+<h3 id="sched_normal-eevdf"><a class="header" href="#sched_normal-eevdf">SCHED_NORMAL (EEVDF)</a></h3>
+<p>The class that runs the rest: your shell, your browser, your compiler. This is where EEVDF operates. The <code>se.load.weight: 1048576</code> in the <code>/proc/$$/sched</code> output is the internal representation of nice 0 (1024 × 1024 for precision scaling).</p>
+<h3 id="sched_batch-and-sched_idle"><a class="header" href="#sched_batch-and-sched_idle">SCHED_BATCH and SCHED_IDLE</a></h3>
+<ul>
+<li><strong>BATCH</strong>: Like NORMAL, but the scheduler assumes it's a CPU-bound job and avoids waking it up aggressively. Useful for batch processing that shouldn't interrupt interactive tasks.</li>
+<li><strong>IDLE</strong>: Runs only when no other task — not even SCHED_NORMAL — is runnable. Lower than nice +19.</li>
+</ul>
+<hr />
+<h2 id="preemption-who-can-interrupt-whom"><a class="header" href="#preemption-who-can-interrupt-whom">Preemption: Who Can Interrupt Whom</a></h2>
+<p>A process runs until something better comes along. But "something better" can mean different things depending on the kernel's preemption configuration.</p>
+<p>This machine's kernel is compiled with <code>PREEMPT_DYNAMIC</code>:</p>
+<pre><code class="language-bash">$ uname -a
+Linux hostname 6.19.11-200.fc43.x86_64 #1 SMP PREEMPT_DYNAMIC ...
+</code></pre>
+<p><code>PREEMPT_DYNAMIC</code> means the preemption model can be changed at runtime via boot parameter. The possible modes:</p>
+<div class="table-wrapper"><table><thead><tr><th>Mode</th><th>When preemption happens</th></tr></thead><tbody>
+<tr><td><code>none</code></td><td>Only at explicit yield points (voluntary)</td></tr>
+<tr><td><code>voluntary</code></td><td>At yield points + explicit preemption checks</td></tr>
+<tr><td><code>full</code></td><td>At almost any kernel code point</td></tr>
+</tbody></table>
+</div>
+<p><code>full</code> preemption gives the best latency — a high-priority process can interrupt even kernel code (with appropriate locking). <code>none</code> gives the best throughput on server workloads.</p>
+<p>Regardless of preemption mode, certain events always trigger a reschedule check:</p>
+<ul>
+<li>A timer interrupt fires (every 1ms by default with <code>CONFIG_HZ=1000</code>)</li>
+<li>A process unblocks (wakes from sleep)</li>
+<li>A process's time slice expires</li>
+<li>A higher-priority process becomes runnable</li>
+</ul>
+<p>When a reschedule is needed, the kernel sets the <code>TIF_NEED_RESCHED</code> flag on the current process. The scheduler runs at the next safe preemption point.</p>
+<hr />
+<h2 id="smp-per-cpu-run-queues-and-load-balancing"><a class="header" href="#smp-per-cpu-run-queues-and-load-balancing">SMP: Per-CPU Run Queues and Load Balancing</a></h2>
+<p>With 12 CPUs, the scheduler doesn't have one global queue — it has <strong>one run queue per CPU</strong>. This eliminates a massive bottleneck: CPUs don't fight over a single lock to pick their next task.</p>
+<pre><code class="language-bash">$ nproc
+12
+</code></pre>
+<p>Each CPU has its own:</p>
+<ul>
+<li><strong>EEVDF run queue</strong>: the red-black tree of normal-priority runnable tasks</li>
+<li><strong>RT run queue</strong>: lists of RT tasks per priority level</li>
+<li><strong>DL run queue</strong>: deadline tasks with their CBS accounting</li>
+</ul>
+<p>When you fork a new process, the kernel picks which CPU to assign it to. When a process wakes up, it returns to the CPU it last ran on — its data is still warm in that CPU's L1/L2 cache. The scheduler tries to keep processes on the same CPU as long as the load stays balanced.</p>
+<h3 id="load-balancing"><a class="header" href="#load-balancing">Load balancing</a></h3>
+<p><strong>Load balancing</strong> runs periodically, triggered by the scheduler tick. The process:</p>
+<ol>
+<li>Find the busiest CPU in the current <strong>scheduling domain</strong></li>
+<li>If it's significantly busier than the local CPU, pull some tasks over</li>
+<li>Prefer tasks that are "cache cold" (haven't run recently) to minimize cache pollution from migration</li>
+</ol>
+<p>The <code>migration/N</code> threads (FIFO priority 99) handle the actual task movement:</p>
+<pre><code class="language-bash">$ ps -eo pid,cls,rtprio,comm | grep migration
+   30 FF      99 migration/0
+   37 FF      99 migration/1
+   44 FF      99 migration/2
+   51 FF      99 migration/3
+   58 FF      99 migration/4
+   65 FF      99 migration/5
+   72 FF      99 migration/6
+   79 FF      99 migration/7
+   86 FF      99 migration/8
+   93 FF      99 migration/9
+  100 FF      99 migration/10
+  107 FF      99 migration/11
+</code></pre>
+<p>One per CPU. They run at the highest RT priority so they can interrupt anything to perform the migration instantly.</p>
+<h3 id="scheduling-domains"><a class="header" href="#scheduling-domains">Scheduling domains</a></h3>
+<p>The scheduler understands CPU topology — SMT siblings (hyperthreads), cores sharing an L2, NUMA nodes. Balancing is done hierarchically: first balance within a core (hyperthreads), then within a socket, then between sockets (NUMA). Crossing NUMA boundaries is expensive and done conservatively.</p>
+<pre><code class="language-bash">$ cat /sys/devices/system/cpu/cpu0/topology/core_siblings_list
+0-11
+</code></pre>
+<p>On this machine, all 12 CPUs are in one scheduling domain (no NUMA).</p>
+<h3 id="autogroups"><a class="header" href="#autogroups">Autogroups</a></h3>
+<p>With <code>sched_autogroup_enabled</code> (on by default):</p>
+<pre><code class="language-bash">$ cat /proc/sys/kernel/sched_autogroup_enabled
+1
+</code></pre>
+<p>The scheduler groups processes by session. If you run <code>make -j12</code> in a terminal, all 12 build jobs share one autogroup. A simultaneous <code>make -j12</code> in another terminal gets its own autogroup. Each group gets 50% of CPU — regardless of how many tasks each contains. This prevents a parallel build from starving an interactive shell session even when it spawns many more threads.</p>
+<hr />
+<h2 id="load-average-what-it-actually-means"><a class="header" href="#load-average-what-it-actually-means">Load Average: What It Actually Means</a></h2>
+<pre><code class="language-bash">$ cat /proc/loadavg
+0.24 0.38 0.37 2/1951 75458
+</code></pre>
+<p>The three numbers (0.24, 0.38, 0.37) are <strong>exponentially weighted moving averages</strong> (EWMA) of the number of processes in:</p>
+<ul>
+<li><strong>RUNNING state</strong> — actually on a CPU or ready to run</li>
+<li><strong>UNINTERRUPTIBLE state</strong> — D state, waiting for I/O that cannot be interrupted</li>
+</ul>
+<p>The time constants are 1-minute, 5-minute, and 15-minute. The "average" doesn't mean average over that full interval — it's an EWMA that weights recent values more heavily, with a half-life roughly equal to that time constant.</p>
+<p>A load average of 1.0 on a single-CPU machine means the CPU is perfectly saturated. On this 12-CPU machine, 12.0 would mean saturation. At 0.24, we have plenty of headroom.</p>
+<h3 id="the-d-state-trap"><a class="header" href="#the-d-state-trap">The D-state trap</a></h3>
+<p>The most important thing to understand about load average: <strong>it includes uninterruptible I/O wait</strong>, not just CPU usage.</p>
+<p>A process blocked on a disk read is in D state. It contributes to load average even though it's not using CPU. This is why you can have a high load average with low CPU utilization:</p>
+<pre><code class="language-bash"># High load, low CPU: probably I/O-bound
+$ uptime
+ 13:47:01 up  1:46,  2 users,  load average: 8.23, 7.91, 6.44
+$ top
+%Cpu(s):  3.2 us,  0.8 sy,  0.0 ni, 94.3 id,  1.5 wa,  0.0 hi,  0.2 si
+</code></pre>
+<p>CPUs are idle 94% of the time — but 8+ tasks are blocked on disk, driving up load average without touching CPU.</p>
+<p>This distinction matters enormously for diagnosis. Load average alone doesn't tell you whether you're CPU-bound or I/O-bound.</p>
+<hr />
+<h2 id="diagnosing-scheduling-latency"><a class="header" href="#diagnosing-scheduling-latency">Diagnosing Scheduling Latency</a></h2>
+<p>When a process is "slow" or "laggy," the question is: is it slow because it can't get CPU, or because it's doing something slow? The scheduler exposes the data to answer this.</p>
+<h3 id="enable-schedstats"><a class="header" href="#enable-schedstats">Enable schedstats</a></h3>
+<p>Per-process scheduling statistics are disabled by default (they add overhead). Enable them:</p>
+<pre><code class="language-bash">echo 1 | sudo tee /proc/sys/kernel/sched_schedstats
+</code></pre>
+<p>Now <code>/proc/PID/schedstat</code> has three columns:</p>
+<pre><code class="language-bash">$ cat /proc/$$/schedstat
+6814340 4857 35
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>1</td><td>Time spent running on CPU (nanoseconds)</td></tr>
+<tr><td>2</td><td>Time spent waiting in the run queue (nanoseconds)</td></tr>
+<tr><td>3</td><td>Number of timeslices run</td></tr>
+</tbody></table>
+</div>
+<p>Column 2 is the key diagnostic: <strong>time spent runnable but not running</strong>. If a process is slow and this number is high, it's not getting CPU — the scheduler is the bottleneck. If this number is low, the process itself is doing something slow (blocking on I/O, lock contention, computation).</p>
+<p>For this bash shell: 4,857 ns of wait time across 35 timeslices. Negligible — the shell is interactive and almost never needs CPU.</p>
+<h3 id="voluntary-vs-involuntary-switches"><a class="header" href="#voluntary-vs-involuntary-switches">Voluntary vs involuntary switches</a></h3>
+<p>From <code>/proc/PID/sched</code>:</p>
+<pre><code>nr_voluntary_switches   ← process called schedule() itself (I/O, sleep, lock wait)
+nr_involuntary_switches ← scheduler took the CPU away (time slice expired)
+</code></pre>
+<p>A process with many involuntary switches is CPU-hungry — it never gives up the CPU voluntarily; the timer interrupt keeps yanking it away. A process with many voluntary switches is latency-sensitive — it keeps waking up, doing a small piece of work, then blocking again.</p>
+<p>For the bash shell: 26 voluntary, 0 involuntary — it always yields before its slice expires. For systemd: 10,422 voluntary, 611 involuntary — it does a lot of short work (voluntary) but occasionally runs long enough to get preempted.</p>
+<h3 id="perf-sched"><a class="header" href="#perf-sched">perf sched</a></h3>
+<p>For deeper analysis, <code>perf sched</code> records scheduler events at the hardware level:</p>
+<pre><code class="language-bash"># Record scheduler events for 5 seconds
+sudo perf sched record -- sleep 5
+
+# Summarize per-process scheduling latency
+sudo perf sched latency | head -20
+</code></pre>
+<p>This shows each process's maximum and average scheduling latency — time from becoming runnable to actually running. A well-tuned interactive system should have p99 latency under a few milliseconds for normal processes.</p>
+<h3 id="run-queue-length"><a class="header" href="#run-queue-length">Run queue length</a></h3>
+<pre><code class="language-bash"># vmstat: the 'r' column is tasks running + waiting for CPU
+$ vmstat 1 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 19581972 308096 6964064    0    0    13     8  170  319  1  0 98  0  0
+ 1  0      0 19581972 308096 6964064    0    0     0     0  219  403  0  0 99  0  0
+ 1  0      0 19581972 308096 6964064    0    0     0     0  185  361  0  0 99  0  0
+</code></pre>
+<p><code>r=2</code> means 2 tasks are currently running or waiting for a CPU. On a 12-CPU machine, this is nothing. If <code>r</code> consistently exceeds <code>nproc</code>, tasks are queuing for CPU time.</p>
+<hr />
+<h2 id="try-it-yourself-4"><a class="header" href="#try-it-yourself-4">Try It Yourself</a></h2>
+<h3 id="1-see-eevdf-slice-for-any-process"><a class="header" href="#1-see-eevdf-slice-for-any-process">1. See EEVDF slice for any process</a></h3>
+<pre><code class="language-bash">chrt -p $$
+chrt -p 1
+</code></pre>
+<h3 id="2-read-the-schedulers-view-of-any-process"><a class="header" href="#2-read-the-schedulers-view-of-any-process">2. Read the scheduler's view of any process</a></h3>
+<pre><code class="language-bash">cat /proc/$$/sched
+cat /proc/1/sched
+</code></pre>
+<p>Look at <code>se.vruntime</code>, <code>nr_voluntary_switches</code>, and <code>nr_involuntary_switches</code>.</p>
+<h3 id="3-see-nice-values-for-all-processes"><a class="header" href="#3-see-nice-values-for-all-processes">3. See nice values for all processes</a></h3>
+<pre><code class="language-bash">ps -eo pid,ni,comm --sort=ni | head -10
+ps -eo pid,ni,comm --sort=-ni | head -10
+</code></pre>
+<h3 id="4-run-something-at-a-lower-priority"><a class="header" href="#4-run-something-at-a-lower-priority">4. Run something at a lower priority</a></h3>
+<pre><code class="language-bash">nice -n 10 sha256sum /dev/urandom &amp;
+kill %1
+</code></pre>
+<h3 id="5-check-real-time-scheduling-on-kernel-threads"><a class="header" href="#5-check-real-time-scheduling-on-kernel-threads">5. Check real-time scheduling on kernel threads</a></h3>
+<pre><code class="language-bash">ps -eo pid,cls,rtprio,comm | grep -v '\-$' | head -20
+# FF = FIFO, RR = round-robin, TS = time-sharing (normal)
+</code></pre>
+<h3 id="6-enable-and-read-per-process-wait-time"><a class="header" href="#6-enable-and-read-per-process-wait-time">6. Enable and read per-process wait time</a></h3>
+<pre><code class="language-bash">echo 1 | sudo tee /proc/sys/kernel/sched_schedstats
+cat /proc/$$/schedstat
+# col 1: ns running, col 2: ns waiting, col 3: timeslices
+</code></pre>
+<h3 id="7-watch-the-run-queue-in-real-time"><a class="header" href="#7-watch-the-run-queue-in-real-time">7. Watch the run queue in real time</a></h3>
+<pre><code class="language-bash">vmstat 1
+# 'r' column = tasks running + waiting for CPU
+# consistently &gt; nproc means CPU saturation
+</code></pre>
+<h3 id="8-find-cpu-hungry-processes"><a class="header" href="#8-find-cpu-hungry-processes">8. Find CPU-hungry processes</a></h3>
+<pre><code class="language-bash">top -b -n 1 | head -20
+</code></pre>
+<h3 id="9-check-autogroup-status"><a class="header" href="#9-check-autogroup-status">9. Check autogroup status</a></h3>
+<pre><code class="language-bash">cat /proc/sys/kernel/sched_autogroup_enabled
+# 1 = on: parallel builds in different terminals each get a fair CPU share
+</code></pre>
+<h3 id="10-profile-scheduling-latency-with-perf"><a class="header" href="#10-profile-scheduling-latency-with-perf">10. Profile scheduling latency with perf</a></h3>
+<pre><code class="language-bash">sudo perf sched record -- sleep 5
+sudo perf sched latency | head -20
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together-4"><a class="header" href="#putting-it-all-together-4">Putting It All Together</a></h2>
+<p>The scheduler's job seems simple — pick the next process — but the constraints are brutal: maximize CPU utilization, minimize latency for interactive tasks, enforce real-time guarantees, scale across dozens of CPUs, and do all of this in microseconds.</p>
+<p>The layered design handles it:</p>
+<pre><code>Timer interrupt (every 1ms)
+    │
+    ▼
+Check scheduling classes top-to-bottom:
+    │
+    ├─ SCHED_DEADLINE task runnable? → run it (CBS enforcement)
+    │
+    ├─ SCHED_FIFO/RR task runnable? → run it (priority order)
+    │
+    └─ SCHED_NORMAL: EEVDF
+           │
+           ├── vruntime tracks accumulated CPU time
+           │   (weighted by nice: higher priority → slower vruntime growth)
+           │
+           ├── virtual_deadline = vruntime + slice / weight
+           │   (2.8ms slice, explicit since EEVDF in Linux 6.6)
+           │
+           └── pick runnable task with earliest virtual_deadline
+    │
+    ├── Per-CPU run queues: no global lock
+    ├── Load balancer: pulls tasks from busy CPUs
+    └── migration/N (FIFO 99): moves tasks between CPUs
+
+Accounting you can read:
+    ├── nr_involuntary_switches → process is CPU-hungry
+    ├── schedstat col 2 → time waiting for CPU (diagnosis)
+    └── load average → EWMA of (RUNNING + UNINTERRUPTIBLE)
+                       high load + low CPU = I/O bottleneck
+</code></pre>
+<p>The <code>2/1951</code> in <code>/proc/loadavg</code> is the whole story compressed: out of 1,951 processes, 2 had something to compute right now. The scheduler gave them a CPU in microseconds, and the other 1,949 never noticed.</p>
+<p>The next chapter goes one level deeper into what all those idle processes are waiting for: the filesystem. Every <code>read()</code>, <code>write()</code>, <code>open()</code> passes through the <strong>VFS layer</strong> — the kernel abstraction that makes ext4, btrfs, tmpfs, and a network socket look identical to userspace.</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-6-the-vfs-layer--how-linux-abstracts-filesystems"><a class="header" href="#linux-deep-dive-6-the-vfs-layer--how-linux-abstracts-filesystems">Linux Deep Dive #6: The VFS Layer — How Linux Abstracts Filesystems</a></h1>
 <p><em>Coming soon.</em></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="linux-deep-dive-7-btrfs--snapshots-subvolumes-and-cow"><a class="header" href="#linux-deep-dive-7-btrfs--snapshots-subvolumes-and-cow">Linux Deep Dive #7: Btrfs — Snapshots, Subvolumes, and CoW</a></h1>

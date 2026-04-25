@@ -180,7 +180,383 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs"><a class="header" href="#linux-deep-dive-5-the-scheduler--how-the-kernel-decides-what-runs">Linux Deep Dive #5: The Scheduler — How the Kernel Decides What Runs</a></h1>
-<p><em>Coming soon.</em></p>
+<p><em>Target: Fedora 43, kernel 6.19.11. Every command in this post is something you can run yourself.</em></p>
+<hr />
+<p>Right now, <code>/proc/loadavg</code> on this machine shows:</p>
+<pre><code>0.24 0.38 0.37 2/1951 75458
+</code></pre>
+<p>The <code>2/1951</code> means 2 processes are running at this exact moment out of 1,951 that exist. The system has 12 CPUs, so it could run 12 simultaneously — but only 2 have something to do right now. The rest are waiting.</p>
+<p>That "waiting" is almost never passive. Processes sleep voluntarily (waiting for I/O, a timer, a lock), then wake up demanding CPU time. Thousands of times per second, the kernel must answer the same question: out of everyone who wants to run right now, who goes next?</p>
+<p>That decision belongs to the scheduler.</p>
+<hr />
+<h2 id="the-big-picture"><a class="header" href="#the-big-picture">The Big Picture</a></h2>
+<p>The Linux scheduler is not a single algorithm. It's a layered system with multiple scheduling classes, each handling different process types. At the top level:</p>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                    Scheduling Classes                    │
+│  (highest priority checked first, runs if runnable)      │
+│                                                          │
+│  SCHED_DEADLINE  ← real-time: explicit deadline/period  │
+│  SCHED_FIFO      ← real-time: first in, never preempted │
+│  SCHED_RR        ← real-time: round-robin with slice    │
+│  SCHED_NORMAL    ← normal processes (you, bash, chrome) │
+│  SCHED_BATCH     ← CPU-bound background work            │
+│  SCHED_IDLE      ← lower than nice +19                  │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Real-time classes (<code>DEADLINE</code>, <code>FIFO</code>, <code>RR</code>) always preempt normal processes. Within the normal class, the scheduler runs <strong>EEVDF</strong> — Earliest Eligible Virtual Deadline First — the algorithm that replaced CFS in Linux 6.6.</p>
+<hr />
+<h2 id="from-cfs-to-eevdf"><a class="header" href="#from-cfs-to-eevdf">From CFS to EEVDF</a></h2>
+<p>To understand EEVDF, you need to understand what it replaced and why.</p>
+<h3 id="the-cfs-mental-model"><a class="header" href="#the-cfs-mental-model">The CFS mental model</a></h3>
+<p><strong>CFS (Completely Fair Scheduler)</strong>, introduced in Linux 2.6.23, was built around one idea: every process should get exactly its fair share of CPU time. Not just approximately — exactly. CFS tracks this precisely.</p>
+<p>The mechanism: each process has a <strong>vruntime</strong> (virtual runtime) counter, measured in nanoseconds. Every nanosecond a process runs, its vruntime increases. But the rate of increase depends on the process's priority — a high-priority process's vruntime grows more slowly, so it gets selected to run more often.</p>
+<p>CFS stored all runnable processes in a <strong>red-black tree</strong> keyed by vruntime. The scheduler always picked the process with the smallest vruntime — the one that has received the least CPU time. After running for one time slice, its vruntime increased, and it was reinserted at its new position. Whoever now had the smallest vruntime ran next.</p>
+<p>This made the scheduler O(log n) for most operations (red-black tree insertion/lookup), with the property that no process ever accumulated more than one time slice of "debt" relative to any other.</p>
+<h3 id="the-eevdf-refinement"><a class="header" href="#the-eevdf-refinement">The EEVDF refinement</a></h3>
+<p>CFS had a problem: it picked the "most deserving" process but had no concept of <em>when</em> that process needed to run. A low-latency audio thread and a CPU-hungry compiler could have the same vruntime, but they have wildly different timing requirements.</p>
+<p><strong>EEVDF</strong> (Earliest Eligible Virtual Deadline First, landed in Linux 6.6) adds an explicit <strong>virtual deadline</strong> alongside vruntime. Each process gets a time slice — a requested service quantum. Its virtual deadline is computed as:</p>
+<pre><code>virtual_deadline = vruntime + time_slice / weight
+</code></pre>
+<p>The scheduler picks the runnable process whose virtual deadline is earliest — not just the one with the smallest vruntime. This gives the scheduler a way to prefer short-running, latency-sensitive tasks over long-running ones even when they have similar accumulated CPU time.</p>
+<h3 id="what-you-can-see"><a class="header" href="#what-you-can-see">What you can see</a></h3>
+<p>On this machine (kernel 6.19.11), every <code>SCHED_NORMAL</code> process has an explicit time slice of <strong>2.8 ms</strong>:</p>
+<pre><code class="language-bash">$ chrt -p $$
+pid 75352's current scheduling policy: SCHED_OTHER
+pid 75352's current scheduling priority: 0
+pid 75352's current runtime parameter: 2800000
+</code></pre>
+<p>That <code>2800000</code> is nanoseconds — 2.8 ms. That's the EEVDF slice. CFS had no such fixed slice; it calculated a "target latency" divided by the number of runnable processes. EEVDF makes it explicit.</p>
+<p>You can see each process's vruntime directly:</p>
+<pre><code class="language-bash">$ cat /proc/$$/sched | head -10
+bash (75352, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :      47483595.680258
+se.vruntime                                  :     102684.252917
+se.sum_exec_runtime                          :          5.248837
+se.nr_migrations                             :                 0
+nr_switches                                  :                62
+nr_voluntary_switches                        :                26
+nr_involuntary_switches                      :                 0
+se.load.weight                               :           1048576
+</code></pre>
+<p>Key fields:</p>
+<ul>
+<li><code>se.vruntime</code> — 102,684 ms accumulated virtual time. This is the scheduler's currency.</li>
+<li><code>se.sum_exec_runtime</code> — only 5.2 ms of actual CPU time. This process barely runs.</li>
+<li><code>nr_voluntary_switches</code> — 26 times this process gave up the CPU willingly (waiting for I/O or input).</li>
+<li><code>nr_involuntary_switches</code> — 0. The scheduler never had to yank the CPU away from it. It always yielded on its own.</li>
+</ul>
+<p>Compare that to a busier process, systemd (PID 1):</p>
+<pre><code class="language-bash">$ cat /proc/1/sched | head -10
+systemd (1, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :      47483479.684417
+se.vruntime                                  :        106.342126
+se.sum_exec_runtime                          :       2724.968813
+nr_switches                                  :              11033
+nr_voluntary_switches                        :              10422
+nr_involuntary_switches                      :                611
+se.load.weight                               :           1048576
+</code></pre>
+<p>systemd has <code>nr_involuntary_switches: 611</code> — 611 times the scheduler decided "time's up" and switched to someone else. That's normal for a long-running process handling many short requests.</p>
+<hr />
+<h2 id="nice-values-and-weights"><a class="header" href="#nice-values-and-weights">Nice Values and Weights</a></h2>
+<p>Not all SCHED_NORMAL processes are equal. The <strong>nice value</strong> controls how fast a process's vruntime accumulates — and therefore how much CPU time it gets.</p>
+<p>Nice values range from <strong>-20</strong> (highest priority) to <strong>+19</strong> (lowest). Default is 0. The name comes from "being nice" to other processes: a process with a high nice value voluntarily gives up CPU time.</p>
+<p>The kernel converts nice values to <strong>weights</strong> using a fixed table where each step is approximately 1.25×:</p>
+<div class="table-wrapper"><table><thead><tr><th>Nice</th><th>Weight</th><th>Relative to nice-0</th></tr></thead><tbody>
+<tr><td>-20</td><td>88761</td><td>~86× more</td></tr>
+<tr><td>-10</td><td>9548</td><td>~9.3×</td></tr>
+<tr><td>-5</td><td>3121</td><td>~3.1×</td></tr>
+<tr><td>0</td><td>1024</td><td>baseline</td></tr>
+<tr><td>+5</td><td>335</td><td>~0.33×</td></tr>
+<tr><td>+10</td><td>110</td><td>~0.11×</td></tr>
+<tr><td>+19</td><td>15</td><td>~68× less</td></tr>
+</tbody></table>
+</div>
+<p>The vruntime delta per nanosecond of real time is:</p>
+<pre><code>delta_vruntime = delta_exec × (1024 / weight)
+</code></pre>
+<p>A nice -20 process (weight 88761) accumulates vruntime 86× <em>slower</em> than a nice 0 process. Since the scheduler picks based on earliest deadline (derived from vruntime), the nice -20 process runs 86× more often. A nice +19 process (weight 15) accumulates vruntime 68× <em>faster</em> — it falls behind quickly and runs rarely.</p>
+<p>You can see nice values live on this machine:</p>
+<pre><code class="language-bash">$ ps -eo pid,ni,comm --sort=ni | head -5
+    PID  NI COMMAND
+      9 -20 rcu_tasks_kthread
+     11 -20 rcu_tasks_rude_
+     12 -20 rcu_tasks_trace
+   5297 -11 pipewire
+</code></pre>
+<p>PipeWire (the audio server) runs at nice -11. That's why audio doesn't stutter when the CPU is loaded. The kernel scheduler ensures it gets CPU time well ahead of normal-priority processes.</p>
+<pre><code class="language-bash">$ ps -eo pid,ni,comm --sort=-ni | head -3
+    PID  NI COMMAND
+ 136282 +19 khugepaged
+  75352   0 bash
+</code></pre>
+<p><code>khugepaged</code> — the background thread that collapses small pages into huge pages — runs at nice +19. It gets CPU time only when nothing else wants it. Perfect for a background maintenance task.</p>
+<p>You can change nice values:</p>
+<pre><code class="language-bash"># Start a process at nice +10
+nice -n 10 make -j12
+
+# Change a running process's nice value (requires root to go more negative)
+renice -n 5 -p &lt;pid&gt;
+</code></pre>
+<hr />
+<h2 id="scheduling-classes-in-detail"><a class="header" href="#scheduling-classes-in-detail">Scheduling Classes in Detail</a></h2>
+<p>When the scheduler runs, it checks each class from highest to lowest priority. If a real-time process is runnable, it runs — the normal class doesn't get a look in.</p>
+<h3 id="sched_deadline"><a class="header" href="#sched_deadline">SCHED_DEADLINE</a></h3>
+<p>The highest priority class. A process declares its needs explicitly:</p>
+<pre><code>period=100ms, runtime=10ms, deadline=50ms
+</code></pre>
+<p>"Every 100ms, give me 10ms of CPU time, and deliver it within 50ms of each period's start."</p>
+<p>The kernel enforces this using <strong>CBS (Constant Bandwidth Server)</strong> — it tracks how much runtime each deadline task has consumed and throttles it if it overruns. Admission control rejects new DEADLINE tasks if they'd make the system unschedulable.</p>
+<p>Real-time audio, video capture, and industrial control systems use this. On this machine, the RT bandwidth pool is configured conservatively:</p>
+<pre><code class="language-bash">$ cat /proc/sys/kernel/sched_rt_period_us
+1000000
+$ cat /proc/sys/kernel/sched_rt_runtime_us
+950000
+</code></pre>
+<p>RT tasks (FIFO, RR, DEADLINE combined) can use at most 95% of each 1-second period. The remaining 5% is reserved for normal processes — a safety valve to prevent a runaway RT process from completely starving the system.</p>
+<h3 id="sched_fifo-and-sched_rr"><a class="header" href="#sched_fifo-and-sched_rr">SCHED_FIFO and SCHED_RR</a></h3>
+<p>Classic POSIX real-time policies. Both run at a fixed priority (1–99, higher is better):</p>
+<ul>
+<li><strong>FIFO</strong>: Runs until it blocks or explicitly yields. No time slicing. Preempts any lower-priority process immediately.</li>
+<li><strong>RR</strong> (Round Robin): Like FIFO, but with a time slice. After the slice expires, it moves to the back of its priority queue. Same priority means round-robin; higher priority always wins.</li>
+</ul>
+<p>The kernel threads that migrate processes between CPUs use FIFO:</p>
+<pre><code class="language-bash">$ ps -eo pid,cls,rtprio,comm | grep migration | head -4
+   30 FF      99 migration/0
+   37 FF      99 migration/1
+   44 FF      99 migration/2
+   51 FF      99 migration/3
+</code></pre>
+<p><code>FF</code> = FIFO, rtprio 99 — the highest possible RT priority. These threads must run instantly when a CPU balance decision is made; nothing should ever preempt them.</p>
+<h3 id="sched_normal-eevdf"><a class="header" href="#sched_normal-eevdf">SCHED_NORMAL (EEVDF)</a></h3>
+<p>The class that runs the rest: your shell, your browser, your compiler. This is where EEVDF operates. The <code>se.load.weight: 1048576</code> in the <code>/proc/$$/sched</code> output is the internal representation of nice 0 (1024 × 1024 for precision scaling).</p>
+<h3 id="sched_batch-and-sched_idle"><a class="header" href="#sched_batch-and-sched_idle">SCHED_BATCH and SCHED_IDLE</a></h3>
+<ul>
+<li><strong>BATCH</strong>: Like NORMAL, but the scheduler assumes it's a CPU-bound job and avoids waking it up aggressively. Useful for batch processing that shouldn't interrupt interactive tasks.</li>
+<li><strong>IDLE</strong>: Runs only when no other task — not even SCHED_NORMAL — is runnable. Lower than nice +19.</li>
+</ul>
+<hr />
+<h2 id="preemption-who-can-interrupt-whom"><a class="header" href="#preemption-who-can-interrupt-whom">Preemption: Who Can Interrupt Whom</a></h2>
+<p>A process runs until something better comes along. But "something better" can mean different things depending on the kernel's preemption configuration.</p>
+<p>This machine's kernel is compiled with <code>PREEMPT_DYNAMIC</code>:</p>
+<pre><code class="language-bash">$ uname -a
+Linux hostname 6.19.11-200.fc43.x86_64 #1 SMP PREEMPT_DYNAMIC ...
+</code></pre>
+<p><code>PREEMPT_DYNAMIC</code> means the preemption model can be changed at runtime via boot parameter. The possible modes:</p>
+<div class="table-wrapper"><table><thead><tr><th>Mode</th><th>When preemption happens</th></tr></thead><tbody>
+<tr><td><code>none</code></td><td>Only at explicit yield points (voluntary)</td></tr>
+<tr><td><code>voluntary</code></td><td>At yield points + explicit preemption checks</td></tr>
+<tr><td><code>full</code></td><td>At almost any kernel code point</td></tr>
+</tbody></table>
+</div>
+<p><code>full</code> preemption gives the best latency — a high-priority process can interrupt even kernel code (with appropriate locking). <code>none</code> gives the best throughput on server workloads.</p>
+<p>Regardless of preemption mode, certain events always trigger a reschedule check:</p>
+<ul>
+<li>A timer interrupt fires (every 1ms by default with <code>CONFIG_HZ=1000</code>)</li>
+<li>A process unblocks (wakes from sleep)</li>
+<li>A process's time slice expires</li>
+<li>A higher-priority process becomes runnable</li>
+</ul>
+<p>When a reschedule is needed, the kernel sets the <code>TIF_NEED_RESCHED</code> flag on the current process. The scheduler runs at the next safe preemption point.</p>
+<hr />
+<h2 id="smp-per-cpu-run-queues-and-load-balancing"><a class="header" href="#smp-per-cpu-run-queues-and-load-balancing">SMP: Per-CPU Run Queues and Load Balancing</a></h2>
+<p>With 12 CPUs, the scheduler doesn't have one global queue — it has <strong>one run queue per CPU</strong>. This eliminates a massive bottleneck: CPUs don't fight over a single lock to pick their next task.</p>
+<pre><code class="language-bash">$ nproc
+12
+</code></pre>
+<p>Each CPU has its own:</p>
+<ul>
+<li><strong>EEVDF run queue</strong>: the red-black tree of normal-priority runnable tasks</li>
+<li><strong>RT run queue</strong>: lists of RT tasks per priority level</li>
+<li><strong>DL run queue</strong>: deadline tasks with their CBS accounting</li>
+</ul>
+<p>When you fork a new process, the kernel picks which CPU to assign it to. When a process wakes up, it returns to the CPU it last ran on — its data is still warm in that CPU's L1/L2 cache. The scheduler tries to keep processes on the same CPU as long as the load stays balanced.</p>
+<h3 id="load-balancing"><a class="header" href="#load-balancing">Load balancing</a></h3>
+<p><strong>Load balancing</strong> runs periodically, triggered by the scheduler tick. The process:</p>
+<ol>
+<li>Find the busiest CPU in the current <strong>scheduling domain</strong></li>
+<li>If it's significantly busier than the local CPU, pull some tasks over</li>
+<li>Prefer tasks that are "cache cold" (haven't run recently) to minimize cache pollution from migration</li>
+</ol>
+<p>The <code>migration/N</code> threads (FIFO priority 99) handle the actual task movement:</p>
+<pre><code class="language-bash">$ ps -eo pid,cls,rtprio,comm | grep migration
+   30 FF      99 migration/0
+   37 FF      99 migration/1
+   44 FF      99 migration/2
+   51 FF      99 migration/3
+   58 FF      99 migration/4
+   65 FF      99 migration/5
+   72 FF      99 migration/6
+   79 FF      99 migration/7
+   86 FF      99 migration/8
+   93 FF      99 migration/9
+  100 FF      99 migration/10
+  107 FF      99 migration/11
+</code></pre>
+<p>One per CPU. They run at the highest RT priority so they can interrupt anything to perform the migration instantly.</p>
+<h3 id="scheduling-domains"><a class="header" href="#scheduling-domains">Scheduling domains</a></h3>
+<p>The scheduler understands CPU topology — SMT siblings (hyperthreads), cores sharing an L2, NUMA nodes. Balancing is done hierarchically: first balance within a core (hyperthreads), then within a socket, then between sockets (NUMA). Crossing NUMA boundaries is expensive and done conservatively.</p>
+<pre><code class="language-bash">$ cat /sys/devices/system/cpu/cpu0/topology/core_siblings_list
+0-11
+</code></pre>
+<p>On this machine, all 12 CPUs are in one scheduling domain (no NUMA).</p>
+<h3 id="autogroups"><a class="header" href="#autogroups">Autogroups</a></h3>
+<p>With <code>sched_autogroup_enabled</code> (on by default):</p>
+<pre><code class="language-bash">$ cat /proc/sys/kernel/sched_autogroup_enabled
+1
+</code></pre>
+<p>The scheduler groups processes by session. If you run <code>make -j12</code> in a terminal, all 12 build jobs share one autogroup. A simultaneous <code>make -j12</code> in another terminal gets its own autogroup. Each group gets 50% of CPU — regardless of how many tasks each contains. This prevents a parallel build from starving an interactive shell session even when it spawns many more threads.</p>
+<hr />
+<h2 id="load-average-what-it-actually-means"><a class="header" href="#load-average-what-it-actually-means">Load Average: What It Actually Means</a></h2>
+<pre><code class="language-bash">$ cat /proc/loadavg
+0.24 0.38 0.37 2/1951 75458
+</code></pre>
+<p>The three numbers (0.24, 0.38, 0.37) are <strong>exponentially weighted moving averages</strong> (EWMA) of the number of processes in:</p>
+<ul>
+<li><strong>RUNNING state</strong> — actually on a CPU or ready to run</li>
+<li><strong>UNINTERRUPTIBLE state</strong> — D state, waiting for I/O that cannot be interrupted</li>
+</ul>
+<p>The time constants are 1-minute, 5-minute, and 15-minute. The "average" doesn't mean average over that full interval — it's an EWMA that weights recent values more heavily, with a half-life roughly equal to that time constant.</p>
+<p>A load average of 1.0 on a single-CPU machine means the CPU is perfectly saturated. On this 12-CPU machine, 12.0 would mean saturation. At 0.24, we have plenty of headroom.</p>
+<h3 id="the-d-state-trap"><a class="header" href="#the-d-state-trap">The D-state trap</a></h3>
+<p>The most important thing to understand about load average: <strong>it includes uninterruptible I/O wait</strong>, not just CPU usage.</p>
+<p>A process blocked on a disk read is in D state. It contributes to load average even though it's not using CPU. This is why you can have a high load average with low CPU utilization:</p>
+<pre><code class="language-bash"># High load, low CPU: probably I/O-bound
+$ uptime
+ 13:47:01 up  1:46,  2 users,  load average: 8.23, 7.91, 6.44
+$ top
+%Cpu(s):  3.2 us,  0.8 sy,  0.0 ni, 94.3 id,  1.5 wa,  0.0 hi,  0.2 si
+</code></pre>
+<p>CPUs are idle 94% of the time — but 8+ tasks are blocked on disk, driving up load average without touching CPU.</p>
+<p>This distinction matters enormously for diagnosis. Load average alone doesn't tell you whether you're CPU-bound or I/O-bound.</p>
+<hr />
+<h2 id="diagnosing-scheduling-latency"><a class="header" href="#diagnosing-scheduling-latency">Diagnosing Scheduling Latency</a></h2>
+<p>When a process is "slow" or "laggy," the question is: is it slow because it can't get CPU, or because it's doing something slow? The scheduler exposes the data to answer this.</p>
+<h3 id="enable-schedstats"><a class="header" href="#enable-schedstats">Enable schedstats</a></h3>
+<p>Per-process scheduling statistics are disabled by default (they add overhead). Enable them:</p>
+<pre><code class="language-bash">echo 1 | sudo tee /proc/sys/kernel/sched_schedstats
+</code></pre>
+<p>Now <code>/proc/PID/schedstat</code> has three columns:</p>
+<pre><code class="language-bash">$ cat /proc/$$/schedstat
+6814340 4857 35
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>1</td><td>Time spent running on CPU (nanoseconds)</td></tr>
+<tr><td>2</td><td>Time spent waiting in the run queue (nanoseconds)</td></tr>
+<tr><td>3</td><td>Number of timeslices run</td></tr>
+</tbody></table>
+</div>
+<p>Column 2 is the key diagnostic: <strong>time spent runnable but not running</strong>. If a process is slow and this number is high, it's not getting CPU — the scheduler is the bottleneck. If this number is low, the process itself is doing something slow (blocking on I/O, lock contention, computation).</p>
+<p>For this bash shell: 4,857 ns of wait time across 35 timeslices. Negligible — the shell is interactive and almost never needs CPU.</p>
+<h3 id="voluntary-vs-involuntary-switches"><a class="header" href="#voluntary-vs-involuntary-switches">Voluntary vs involuntary switches</a></h3>
+<p>From <code>/proc/PID/sched</code>:</p>
+<pre><code>nr_voluntary_switches   ← process called schedule() itself (I/O, sleep, lock wait)
+nr_involuntary_switches ← scheduler took the CPU away (time slice expired)
+</code></pre>
+<p>A process with many involuntary switches is CPU-hungry — it never gives up the CPU voluntarily; the timer interrupt keeps yanking it away. A process with many voluntary switches is latency-sensitive — it keeps waking up, doing a small piece of work, then blocking again.</p>
+<p>For the bash shell: 26 voluntary, 0 involuntary — it always yields before its slice expires. For systemd: 10,422 voluntary, 611 involuntary — it does a lot of short work (voluntary) but occasionally runs long enough to get preempted.</p>
+<h3 id="perf-sched"><a class="header" href="#perf-sched">perf sched</a></h3>
+<p>For deeper analysis, <code>perf sched</code> records scheduler events at the hardware level:</p>
+<pre><code class="language-bash"># Record scheduler events for 5 seconds
+sudo perf sched record -- sleep 5
+
+# Summarize per-process scheduling latency
+sudo perf sched latency | head -20
+</code></pre>
+<p>This shows each process's maximum and average scheduling latency — time from becoming runnable to actually running. A well-tuned interactive system should have p99 latency under a few milliseconds for normal processes.</p>
+<h3 id="run-queue-length"><a class="header" href="#run-queue-length">Run queue length</a></h3>
+<pre><code class="language-bash"># vmstat: the 'r' column is tasks running + waiting for CPU
+$ vmstat 1 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 19581972 308096 6964064    0    0    13     8  170  319  1  0 98  0  0
+ 1  0      0 19581972 308096 6964064    0    0     0     0  219  403  0  0 99  0  0
+ 1  0      0 19581972 308096 6964064    0    0     0     0  185  361  0  0 99  0  0
+</code></pre>
+<p><code>r=2</code> means 2 tasks are currently running or waiting for a CPU. On a 12-CPU machine, this is nothing. If <code>r</code> consistently exceeds <code>nproc</code>, tasks are queuing for CPU time.</p>
+<hr />
+<h2 id="try-it-yourself"><a class="header" href="#try-it-yourself">Try It Yourself</a></h2>
+<h3 id="1-see-eevdf-slice-for-any-process"><a class="header" href="#1-see-eevdf-slice-for-any-process">1. See EEVDF slice for any process</a></h3>
+<pre><code class="language-bash">chrt -p $$
+chrt -p 1
+</code></pre>
+<h3 id="2-read-the-schedulers-view-of-any-process"><a class="header" href="#2-read-the-schedulers-view-of-any-process">2. Read the scheduler's view of any process</a></h3>
+<pre><code class="language-bash">cat /proc/$$/sched
+cat /proc/1/sched
+</code></pre>
+<p>Look at <code>se.vruntime</code>, <code>nr_voluntary_switches</code>, and <code>nr_involuntary_switches</code>.</p>
+<h3 id="3-see-nice-values-for-all-processes"><a class="header" href="#3-see-nice-values-for-all-processes">3. See nice values for all processes</a></h3>
+<pre><code class="language-bash">ps -eo pid,ni,comm --sort=ni | head -10
+ps -eo pid,ni,comm --sort=-ni | head -10
+</code></pre>
+<h3 id="4-run-something-at-a-lower-priority"><a class="header" href="#4-run-something-at-a-lower-priority">4. Run something at a lower priority</a></h3>
+<pre><code class="language-bash">nice -n 10 sha256sum /dev/urandom &amp;
+kill %1
+</code></pre>
+<h3 id="5-check-real-time-scheduling-on-kernel-threads"><a class="header" href="#5-check-real-time-scheduling-on-kernel-threads">5. Check real-time scheduling on kernel threads</a></h3>
+<pre><code class="language-bash">ps -eo pid,cls,rtprio,comm | grep -v '\-$' | head -20
+# FF = FIFO, RR = round-robin, TS = time-sharing (normal)
+</code></pre>
+<h3 id="6-enable-and-read-per-process-wait-time"><a class="header" href="#6-enable-and-read-per-process-wait-time">6. Enable and read per-process wait time</a></h3>
+<pre><code class="language-bash">echo 1 | sudo tee /proc/sys/kernel/sched_schedstats
+cat /proc/$$/schedstat
+# col 1: ns running, col 2: ns waiting, col 3: timeslices
+</code></pre>
+<h3 id="7-watch-the-run-queue-in-real-time"><a class="header" href="#7-watch-the-run-queue-in-real-time">7. Watch the run queue in real time</a></h3>
+<pre><code class="language-bash">vmstat 1
+# 'r' column = tasks running + waiting for CPU
+# consistently &gt; nproc means CPU saturation
+</code></pre>
+<h3 id="8-find-cpu-hungry-processes"><a class="header" href="#8-find-cpu-hungry-processes">8. Find CPU-hungry processes</a></h3>
+<pre><code class="language-bash">top -b -n 1 | head -20
+</code></pre>
+<h3 id="9-check-autogroup-status"><a class="header" href="#9-check-autogroup-status">9. Check autogroup status</a></h3>
+<pre><code class="language-bash">cat /proc/sys/kernel/sched_autogroup_enabled
+# 1 = on: parallel builds in different terminals each get a fair CPU share
+</code></pre>
+<h3 id="10-profile-scheduling-latency-with-perf"><a class="header" href="#10-profile-scheduling-latency-with-perf">10. Profile scheduling latency with perf</a></h3>
+<pre><code class="language-bash">sudo perf sched record -- sleep 5
+sudo perf sched latency | head -20
+</code></pre>
+<hr />
+<h2 id="putting-it-all-together"><a class="header" href="#putting-it-all-together">Putting It All Together</a></h2>
+<p>The scheduler's job seems simple — pick the next process — but the constraints are brutal: maximize CPU utilization, minimize latency for interactive tasks, enforce real-time guarantees, scale across dozens of CPUs, and do all of this in microseconds.</p>
+<p>The layered design handles it:</p>
+<pre><code>Timer interrupt (every 1ms)
+    │
+    ▼
+Check scheduling classes top-to-bottom:
+    │
+    ├─ SCHED_DEADLINE task runnable? → run it (CBS enforcement)
+    │
+    ├─ SCHED_FIFO/RR task runnable? → run it (priority order)
+    │
+    └─ SCHED_NORMAL: EEVDF
+           │
+           ├── vruntime tracks accumulated CPU time
+           │   (weighted by nice: higher priority → slower vruntime growth)
+           │
+           ├── virtual_deadline = vruntime + slice / weight
+           │   (2.8ms slice, explicit since EEVDF in Linux 6.6)
+           │
+           └── pick runnable task with earliest virtual_deadline
+    │
+    ├── Per-CPU run queues: no global lock
+    ├── Load balancer: pulls tasks from busy CPUs
+    └── migration/N (FIFO 99): moves tasks between CPUs
+
+Accounting you can read:
+    ├── nr_involuntary_switches → process is CPU-hungry
+    ├── schedstat col 2 → time waiting for CPU (diagnosis)
+    └── load average → EWMA of (RUNNING + UNINTERRUPTIBLE)
+                       high load + low CPU = I/O bottleneck
+</code></pre>
+<p>The <code>2/1951</code> in <code>/proc/loadavg</code> is the whole story compressed: out of 1,951 processes, 2 had something to compute right now. The scheduler gave them a CPU in microseconds, and the other 1,949 never noticed.</p>
+<p>The next chapter goes one level deeper into what all those idle processes are waiting for: the filesystem. Every <code>read()</code>, <code>write()</code>, <code>open()</code> passes through the <strong>VFS layer</strong> — the kernel abstraction that makes ext4, btrfs, tmpfs, and a network socket look identical to userspace.</p>
+<hr />
+<p><em>Part of the <a href="./README.html">Linux Deep Dive</a> series.</em></p>
 
                     </main>
 
